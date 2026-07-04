@@ -61,7 +61,7 @@ global_excludes:
   - "*.swp"
   - "*.swo"
   - "*~"
-  - ".env 
+  - ".env"
   - ".env.local"
   - ".coverage"
   - ".pytest_cache"
@@ -91,7 +91,7 @@ drive:
   label: OliDrive
   # Optional but recommended: get with `findmnt -no UUID /run/media/$USER/OliDrive`
   # Guards against a different drive that happens to share the label.
-  expected_uuid: ""
+  expected_uuid: "507C17757C1754D6"
   # Seconds to wait for udisks2 to finish auto-mounting after device insertion.
   mount_timeout: 30
 
