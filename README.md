@@ -43,19 +43,10 @@ make check          # reports missing dnf packages, installs nothing
 make install-deps   # installs only what's missing, asks first
 make check-collection
 make install-collection
-
-sudo cp systemd/borg-drive-handler@.service /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-Find your drive's UUID while it's plugged in and mounted:
-```bash
-findmnt -no UUID /run/media/$USER/OliDrive
-```
-Put that into `manifest/manifest.yaml` under `drive.expected_uuid`. Then edit
-`udev/99-backup-drive.rules` with the same UUID and install it:
-```bash
-sudo cp udev/99-backup-drive.rules /etc/udev/rules.d/
-sudo udevadm control --reload
+make detect-uuid       # drive plugged in; writes UUID into manifest.yaml, asks first
+make install-udev-rule # renders the rule with that UUID, installs/updates under /etc, asks first
+make install-service   # installs/updates the systemd unit, asks first
+make borg-init         # inits the repo on the drive, only if one isn't already there
 ```
 
 Edit `manifest/manifest.yaml` to add this host under `hosts:` with its
