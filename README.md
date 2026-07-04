@@ -1,4 +1,4 @@
-# custom_borg_sync (Linux/Fedora scope)
+# porta-winux (Linux/Fedora scope)
 
 Backup + sync system for two Fedora machines (desktop, laptop) sharing one
 external drive that gets physically moved between them. Windows-side work
@@ -39,15 +39,15 @@ udev/99-backup-drive.rules
 sudo dnf install borgbackup borgmatic ansible rsync python3-pyyaml python3-jinja2
 ansible-galaxy collection install community.general   # for the flatpak module
 
-git clone <this repo> ~/custom_borg_sync
+git clone <this repo> ~/porta-winux
 sudo mkdir -p /mnt/backupdrive
-sudo cp ~/custom_borg_sync/systemd/borg-drive-handler@.service /etc/systemd/system/
+sudo cp ~/porta-winux/systemd/borg-drive-handler@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # find your drive's filesystem UUID
 sudo blkid /dev/sdX1
 # edit udev/99-backup-drive.rules with that UUID, then:
-sudo cp ~/custom_borg_sync/udev/99-backup-drive.rules /etc/udev/rules.d/
+sudo cp ~/porta-winux/udev/99-backup-drive.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 ```
 

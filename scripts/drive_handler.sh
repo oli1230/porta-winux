@@ -10,7 +10,8 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MOUNT_POINT="${BORG_DRIVE_MOUNT:-/mnt/backupdrive}"
+# MOUNT_POINT="${BORG_DRIVE_MOUNT:-/mnt/backupdrive}"
+MOUNT_POINT="${/run/media/obs1230/OliDrive/porta-winux:-/mnt/backupdrive}"
 HOST="$(hostname -s)"
 LOCAL_LOG="/var/log/borg-sync/${HOST}.log"
 DRIVE_LOG="${MOUNT_POINT}/logs/${HOST}.log"

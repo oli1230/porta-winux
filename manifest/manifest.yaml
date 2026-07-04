@@ -90,7 +90,7 @@ livesync:
   root: /LiveSync
   ledger_filename: .sync-ledger.json
   # Local cache of "what generation of each folder have I last reconciled with"
-  local_cache: /home/oli/.local/state/borg_sync/ledger_cache.json
+  local_cache: /home/obs1230/.local/state/borg_sync/ledger_cache.json
 
 borg:
   repo_root: /Backups           # relative to drive mount point
