@@ -85,6 +85,16 @@ global_excludes:
   - "/home/obs1230/Downloads"
   - "/home/obs1230/Desktop"
 
+drive:
+  # This is the udisks2/GVFS auto-mount label — the same name you see in
+  # Dolphin/GNOME Files. Mount path is derived as /run/media/$USER/<label>.
+  label: OliDrive
+  # Optional but recommended: get with `findmnt -no UUID /run/media/$USER/OliDrive`
+  # Guards against a different drive that happens to share the label.
+  expected_uuid: ""
+  # Seconds to wait for udisks2 to finish auto-mounting after device insertion.
+  mount_timeout: 30
+
 livesync:
   # Folder name on the drive under which mirrored copies live, and the ledger file name.
   root: /LiveSync

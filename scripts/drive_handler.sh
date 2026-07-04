@@ -1,32 +1,35 @@
 #!/usr/bin/env bash
-# Orchestrator run whenever the external backup drive is attached (see
-# systemd/borg-drive-handler@.service + udev/99-backup-drive.rules).
-#
-# Deliberately does NOT install/modify software. Package installation
-# (ansible/playbooks/ensure_packages.yml) is a separate, manually-triggered
-# step — automatic unattended installs on every drive-plug would be the
-# opposite of "foolproof." This script only ever: reads facts, syncs data,
-# backs up, and logs.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# MOUNT_POINT="${BORG_DRIVE_MOUNT:-/mnt/backupdrive}"
-MOUNT_POINT="${/run/media/obs1230/OliDrive/porta-winux:-/mnt/backupdrive}"
 HOST="$(hostname -s)"
 LOCAL_LOG="/var/log/borg-sync/${HOST}.log"
-DRIVE_LOG="${MOUNT_POINT}/logs/${HOST}.log"
 
-mkdir -p "$(dirname "$LOCAL_LOG")" "$(dirname "$DRIVE_LOG")" 2>/dev/null || true
+mkdir -p "$(dirname "$LOCAL_LOG")" 2>/dev/null || true
+
+log_local() { echo "[$(date -Iseconds)] $*" | tee -a "$LOCAL_LOG"; }
+
+DRIVE_LABEL="$(python3 -c "import yaml; print(yaml.safe_load(open('${REPO_DIR}/manifest/manifest.yaml'))['drive']['label'])")"
+DRIVE_UUID="$(python3 -c "import yaml; print(yaml.safe_load(open('${REPO_DIR}/manifest/manifest.yaml'))['drive'].get('expected_uuid',''))")"
+DRIVE_TIMEOUT="$(python3 -c "import yaml; print(yaml.safe_load(open('${REPO_DIR}/manifest/manifest.yaml'))['drive'].get('mount_timeout',30))")"
+
+CHECK_ARGS=(--label "$DRIVE_LABEL" --timeout "$DRIVE_TIMEOUT")
+[[ -n "$DRIVE_UUID" ]] && CHECK_ARGS+=(--uuid "$DRIVE_UUID")
+
+if ! MOUNT_POINT="$("${REPO_DIR}/scripts/check_drive_mounted.sh" "${CHECK_ARGS[@]}")"; then
+    log_local "ERROR: drive '${DRIVE_LABEL}' not verified mounted, aborting"
+    exit 1
+fi
+
+DRIVE_LOG="${MOUNT_POINT}/logs/${HOST}.log"
+mkdir -p "$(dirname "$DRIVE_LOG")" 2>/dev/null || true
 
 log() {
     local msg="[$(date -Iseconds)] $*"
     echo "$msg" | tee -a "$LOCAL_LOG" >>"$DRIVE_LOG" 2>/dev/null || echo "$msg" | tee -a "$LOCAL_LOG"
 }
 
-if ! mountpoint -q "$MOUNT_POINT"; then
-    log "ERROR: $MOUNT_POINT is not mounted, aborting"
-    exit 1
-fi
+log "verified $DRIVE_LABEL mounted at $MOUNT_POINT"
 
 log "=== drive attached, starting sync sequence for $HOST ==="
 

@@ -4,8 +4,10 @@ After=local-fs.target
 
 [Service]
 Type=oneshot
-# Change to your actual user; do not run this as root.
+# Do not run this as root. $USER must be set
+# correctly here since drive_handler.sh derives the udisks2 mount path
+# from it (/run/media/$USER/<label>) via check_drive_mounted.sh.
 User=obs1230
-Environment=/run/media/obs1230/OliDrive/porta-winux
 ExecStart=/home/obs1230/Code/sandbox/porta-winux/scripts/drive_handler.sh
 # Prevents overlapping runs if the drive bounces (disconnect/reconnect quickly)
+# TODO: move out of sandbox

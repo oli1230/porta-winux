@@ -35,19 +35,26 @@ udev/99-backup-drive.rules
 
 ## One-time setup per machine
 
+Check what's missing, then install only that, with confirmation at each step:
 ```bash
-sudo dnf install borgbackup borgmatic ansible rsync python3-pyyaml python3-jinja2
-ansible-galaxy collection install community.general   # for the flatpak module
+git clone https://github.com/oli1230/porta-winux.git ~/porta-winux
+cd ~/porta-winux
+make check          # reports missing dnf packages, installs nothing
+make install-deps   # installs only what's missing, asks first
+make check-collection
+make install-collection
 
-git clone <this repo> ~/porta-winux
-sudo mkdir -p /mnt/backupdrive
-sudo cp ~/porta-winux/systemd/borg-drive-handler@.service /etc/systemd/system/
+sudo cp systemd/borg-drive-handler@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-
-# find your drive's filesystem UUID
-sudo blkid /dev/sdX1
-# edit udev/99-backup-drive.rules with that UUID, then:
-sudo cp ~/porta-winux/udev/99-backup-drive.rules /etc/udev/rules.d/
+```
+Find your drive's UUID while it's plugged in and mounted:
+```bash
+findmnt -no UUID /run/media/$USER/OliDrive
+```
+Put that into `manifest/manifest.yaml` under `drive.expected_uuid`. Then edit
+`udev/99-backup-drive.rules` with the same UUID and install it:
+```bash
+sudo cp udev/99-backup-drive.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 ```
 
@@ -57,20 +64,17 @@ actual paths.
 **First-ever run per host** needs to `borg init` the repo before borgmatic
 can use it:
 ```bash
-mkdir -p /mnt/backupdrive/Backups
-borg init --encryption=repokey-blake2 /mnt/backupdrive/Backups/$(hostname -s).borgrepo
+borg init --encryption=repokey-blake2 /run/media/$USER/OliDrive/Backups/$(hostname -s).borgrepo
 ```
 
 ## Trigger reliability note
 
-The udev rule fires on device *arrival*, before the filesystem is
-necessarily mounted. If your desktop environment auto-mounts removable
-media (GNOME/KDE do, by default) this is fine in practice — the mount
-finishes before `drive_handler.sh`'s `mountpoint -q` check runs. If you're
-on a minimal/tiling setup without automount, mount explicitly first (or add
-a `systemd.mount` unit for the drive) — the handler will simply fail fast
-with a clear error ("is not mounted") rather than doing anything
-half-attached.
+The udev rule fires on device *arrival*, before udisks2 necessarily finishes
+mounting it to `/run/media/$USER/<label>`. That's handled: `drive_handler.sh`
+calls `scripts/check_drive_mounted.sh`, which polls (default 30s) for the
+mount to appear and, if `drive.expected_uuid` is set, verifies it's actually
+the right physical drive before doing anything else — otherwise it fails
+fast with a clear error rather than writing to the wrong place.
 
 ## Restoring a machine from scratch
 
