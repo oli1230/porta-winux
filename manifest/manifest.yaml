@@ -103,7 +103,8 @@ livesync:
   local_cache: /home/obs1230/.local/state/borg_sync/ledger_cache.json
 
 borg:
-  repo_root: /Backups           # relative to drive mount point
+  # below is the name of directory on the external drive
+  repo_root: /porta-winux-drive          # relative to drive mount point
   retention:
     keep_daily: 7
     keep_weekly: 4

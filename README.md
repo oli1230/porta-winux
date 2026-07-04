@@ -43,19 +43,14 @@ make check          # reports missing dnf packages, installs nothing
 make install-deps   # installs only what's missing, asks first
 make check-collection
 make install-collection
+
+# Edit `manifest/manifest.yaml` to add this host under `hosts:` with its
+# actual paths.
+
 make detect-uuid       # drive plugged in; writes UUID into manifest.yaml, asks first
 make install-udev-rule # renders the rule with that UUID, installs/updates under /etc, asks first
 make install-service   # installs/updates the systemd unit, asks first
 make borg-init         # inits the repo on the drive, only if one isn't already there
-```
-
-Edit `manifest/manifest.yaml` to add this host under `hosts:` with its
-actual paths.
-
-**First-ever run per host** needs to `borg init` the repo before borgmatic
-can use it:
-```bash
-borg init --encryption=repokey-blake2 /run/media/$USER/OliDrive/Backups/$(hostname -s).borgrepo
 ```
 
 ## Trigger reliability note
