@@ -1,0 +1,31 @@
+---
+# NOT run automatically by drive_handler.sh. Run this by hand, e.g.:
+#   ansible-playbook ansible/playbooks/ensure_packages.yml --extra-vars "target_host=laptop-fedora" --ask-become-pass
+#
+# Intent: this is your "reinstall this machine's software" button, driven by
+# the manifest gather_facts.yml produced — not a giant binary restore of
+# /usr or Program Files.
+- name: Ensure software from manifest is installed
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    target_host: "{{ target_host | mandatory }}"
+    manifest_file: "{{ playbook_dir }}/../../manifest/packages/{{ target_host }}-packages.yml"
+
+  tasks:
+    - name: Load package manifest for {{ target_host }}
+      ansible.builtin.include_vars:
+        file: "{{ manifest_file }}"
+
+    - name: Install dnf packages
+      ansible.builtin.dnf:
+        name: "{{ dnf_userinstalled }}"
+        state: present
+
+    - name: Install flatpak apps
+      community.general.flatpak:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ flatpak_apps }}"
+      when: flatpak_apps | length > 0

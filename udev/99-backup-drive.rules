@@ -1,0 +1,13 @@
+# Replace REPLACE-WITH-YOUR-UUID with the actual filesystem UUID of the backup
+# drive's partition. Find it with:  sudo blkid /dev/sdX1
+#
+# This rule fires on device *arrival*, not on mount completion. If your
+# desktop environment (GNOME/KDE) auto-mounts removable media, that mount
+# usually completes fast enough that drive_handler.sh's `mountpoint -q`
+# check succeeds by the time the service starts. If it doesn't (or you don't
+# run a DE with automount, e.g. a headless/tiling setup), use the
+# borg-drive-handler.path unit instead, which waits for the mountpoint
+# marker file to exist before firing — see systemd/README notes.
+
+SUBSYSTEM=="block", ENV{ID_FS_UUID}=="REPLACE-WITH-YOUR-UUID", ACTION=="add", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}+="borg-drive-handler@%k.service"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Borg backup + livesync handler for external drive (instance: %i)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Change to your actual user; do not run this as root.
+User=oli
+Environment=BORG_DRIVE_MOUNT=/mnt/backupdrive
+ExecStart=/home/oli/custom_borg_sync/scripts/drive_handler.sh
+# Prevents overlapping runs if the drive bounces (disconnect/reconnect quickly)

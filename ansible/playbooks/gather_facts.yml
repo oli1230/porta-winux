@@ -1,0 +1,55 @@
+---
+# Read-only. Never installs or changes anything on the machine.
+# Writes manifest/packages/<target_host>-packages.yml, which is meant to be
+# committed to git — that's your reinstall manifest if this machine dies.
+- name: Gather installed software inventory
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    target_host: "{{ target_host | default(ansible_hostname) }}"
+    output_dir: "{{ playbook_dir }}/../../manifest/packages"
+
+  tasks:
+    - name: Gather RPM package facts
+      ansible.builtin.package_facts:
+        manager: rpm
+
+    - name: List explicitly user-installed dnf packages (excludes deps pulled in automatically)
+      ansible.builtin.shell:
+        cmd: dnf repoquery --userinstalled --qf '%{name}' 2>/dev/null | sort
+      register: userinstalled
+      changed_when: false
+
+    - name: List installed flatpak apps
+      ansible.builtin.command: flatpak list --app --columns=application
+      register: flatpak_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write package manifest
+      ansible.builtin.copy:
+        dest: "{{ output_dir }}/{{ target_host }}-packages.yml"
+        mode: "0644"
+        content: |
+          # AUTO-GENERATED {{ ansible_date_time.iso8601 }} by gather_facts.yml — commit this file.
+          host: {{ target_host }}
+          generated_at: "{{ ansible_date_time.iso8601 }}"
+          dnf_userinstalled:
+          {% for name in userinstalled.stdout_lines %}
+            - {{ name }}
+          {% endfor %}
+          flatpak_apps:
+          {% for app in flatpak_raw.stdout_lines | default([]) %}
+            - {{ app }}
+          {% endfor %}
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "Wrote {{ output_dir }}/{{ target_host }}-packages.yml ({{ userinstalled.stdout_lines | length }} dnf, {{ (flatpak_raw.stdout_lines | default([])) | length }} flatpak)"

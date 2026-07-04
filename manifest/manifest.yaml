@@ -1,0 +1,101 @@
+# manifest.yaml
+# Single source of truth for backup & sync scope.
+# Everything else (borgmatic configs, ledger_sync targets) is GENERATED from this file.
+#
+# tags per path:
+#   both       -> included in Borg AND mirrored into /LiveSync on the drive
+#   borg-only  -> included in Borg history only (not needed as a "grab it on the other PC" copy)
+#   livesync-only -> mirrored live, but not archived by Borg (rare; e.g. large scratch data)
+
+hosts:
+  desktop-fedora:
+    paths:
+      - path: /home/obs1230/.bashrc
+        tags: [both]
+      - path: /home/obs1230/.bash_aliases
+        tags: [both]
+      - path: /home/obs1230/.ssh/
+        tags: [both]
+      - path: /home/obs1230/Documents
+        tags: [both]
+      - path: /home/obs1230/Code
+        tags: [both]
+      - path: /home/obs1230/Pictures
+        tags: [both]
+      - path: /home/obs1230/.config/nvim
+        tags: [borg-only]
+      - path: /home/obs1230/.config/ranger
+        tags: [borg-only]
+
+  laptop-fedora:
+    paths:
+      - path: /home/obs1230/Documents
+        tags: [both]
+      - path: /home/obs1230/Projects
+        tags: [both]
+      - path: /home/obs1230/.config/nvim
+        tags: [borg-only]
+
+# Applies to every host's borgmatic config
+global_excludes:
+  - "*.cache"
+  - "**/node_modules"
+  - "**/.venv"
+  - "**/__pycache__"
+  - "**/*.tmp"
+  - "*.tmp"
+  - "__pycache__"
+  - "*lib"
+  - "*.tmp"
+  - "node_modules"
+  - ".svn"
+  - ".hg"
+  - "vendor"
+  - ".vscode"
+  - ".idea"
+  - ".vs"
+  - "*.log"
+  - "*.cache"
+  - ".DS_Store"
+  - "Thumbs.db"
+  - "*.swp"
+  - "*.swo"
+  - "*~"
+  - ".env 
+  - ".env.local"
+  - ".coverage"
+  - ".pytest_cache"
+  - ".tox"
+  - "venv"
+  - "env"
+  - ".venv"
+  - "virtualenv"
+  - "bower_components"
+  - "jspm_packages"
+  - ".nuxt"
+  - ".next"
+  - ".svelte-kit"
+  - "coverage"
+  - "*.egg-info"
+  - ".gradle"
+  - ".m2"
+  - "CMakeFiles"
+  - ".vagrant"
+  - "/home/obs1230/Code/sandbox/"
+  - "/home/obs1230/Downloads"
+  - "/home/obs1230/Desktop"
+
+livesync:
+  # Folder name on the drive under which mirrored copies live, and the ledger file name.
+  root: /LiveSync
+  ledger_filename: .sync-ledger.json
+  # Local cache of "what generation of each folder have I last reconciled with"
+  local_cache: /home/oli/.local/state/borg_sync/ledger_cache.json
+
+borg:
+  repo_root: /Backups           # relative to drive mount point
+  retention:
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 6
+  check_weekday: 7               # ISO weekday (7 = Sunday) to run `borgmatic check`
