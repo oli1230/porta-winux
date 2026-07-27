@@ -1,0 +1,18 @@
+#cloud-config
+users:
+  - name: test
+    groups: wheel
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - @PUBKEY@
+packages:
+  - restic
+  - rsync
+  - python3
+runcmd:
+  # Mount the fake external drive (second virtio disk) where a real
+  # removable drive would appear, so path auto-detection is exercised.
+  - mkdir -p /run/media/test/SYNCDRIVE
+  - mount /dev/vdb /run/media/test/SYNCDRIVE || mount /dev/vdb1 /run/media/test/SYNCDRIVE
+  - chown -R test:test /run/media/test/SYNCDRIVE

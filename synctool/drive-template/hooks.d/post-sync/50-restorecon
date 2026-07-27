@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fedora/SELinux: restore security contexts on files synctool just wrote.
+# Receives affected paths (newline-separated) in $SYNCTOOL_PATHS.
+set -u
+command -v restorecon >/dev/null || exit 0
+[ "${SYNCTOOL_ROOT:-/}" = "/" ] || exit 0   # skip in sandboxed test runs
+[ -n "${SYNCTOOL_PATHS:-}" ] || exit 0
+printf '%s\n' "$SYNCTOOL_PATHS" | while IFS= read -r p; do
+  [ -n "$p" ] && restorecon -F "$p" 2>/dev/null
+done
+exit 0
