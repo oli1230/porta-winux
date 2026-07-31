@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "porta-winux"
+version = "0.1.0"
+description = "Portable snapshot/checkout/commit/sync tool over restic for external-drive system backups"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# The interactive browser. Everything else works without it.
+tui = ["textual>=0.50"]
+dev = ["ruff", "pytest"]
+
+[project.scripts]
+porta-winux = "porta_winux.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+porta_winux = [
+  "drive_template/**/*",
+  "drive_template/**/.keep",
+  "drive_template/bin/README",
+]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.ruff]
+line-length = 100

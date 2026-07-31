@@ -1,0 +1,7 @@
+# Fast-tier test environment: Fedora userspace in a container.
+# Usage:  make container-test
+FROM registry.fedoraproject.org/fedora:43
+RUN dnf install -y restic python3 && dnf clean all
+WORKDIR /porta-winux
+COPY . .
+CMD ["bash", "test/smoke.sh"]
