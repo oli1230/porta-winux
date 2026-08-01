@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "porta-winux"
-version = "0.1.0"
+version = "0.1.1"
 description = "Portable snapshot/checkout/commit/sync tool over restic for external-drive system backups"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,8 @@ dev = ["ruff", "pytest"]
 porta-winux = "porta_winux.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["porta_winux*"]
 
 [tool.setuptools.package-data]
 porta_winux = [

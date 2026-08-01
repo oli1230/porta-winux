@@ -47,11 +47,11 @@ do_fetch() {
 }
 
 do_drive() {
-  echo "Building fake external drive image from src/porta_winux/drive_template/…"
+  echo "Building fake external drive image from porta_winux/drive_template/…"
   rm -f "$DRIVE_IMG"
   # virt-make-fs packs a directory into a filesystem image without root.
   virt-make-fs --format=qcow2 --type=ext4 --size=+2G \
-    "$REPO_ROOT/src/porta_winux/drive_template" "$DRIVE_IMG"
+    "$REPO_ROOT/porta_winux/drive_template" "$DRIVE_IMG"
   echo "drive image: $DRIVE_IMG"
 }
 

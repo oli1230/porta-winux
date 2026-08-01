@@ -240,6 +240,25 @@ def revert(
     return safety
 
 
+def select_restore_snapshot(
+    store: SnapshotStore,
+    manifest: Manifest,
+    profile_name: str | None,
+    snapshot_id: str | None = None,
+) -> Snapshot:
+    """Pick the system snapshot restore_full would use (latest for the
+    profile, or the given id). Split out so the CLI can show a plan and
+    confirm with the user before anything is written."""
+    prof = manifest.profile(profile_name)
+    candidates = store.snapshots(tags=["system"])
+    candidates = [s for s in candidates if f"profile:{prof.name}" in s.tags]
+    if snapshot_id:
+        candidates = [s for s in candidates if s.id.startswith(snapshot_id)]
+    if not candidates:
+        raise PortaWinuxError(f"no system snapshots for profile '{prof.name}'")
+    return candidates[-1]
+
+
 def restore_full(
     store: SnapshotStore,
     layout: DriveLayout,
@@ -250,14 +269,7 @@ def restore_full(
 ) -> Snapshot:
     """Fresh-system setup: restore the latest (or given) system snapshot for a
     profile onto `root`, then record it as this host's base."""
-    prof = manifest.profile(profile_name)
-    candidates = store.snapshots(tags=["system"])
-    candidates = [s for s in candidates if f"profile:{prof.name}" in s.tags]
-    if snapshot_id:
-        candidates = [s for s in candidates if s.id.startswith(snapshot_id)]
-    if not candidates:
-        raise PortaWinuxError(f"no system snapshots for profile '{prof.name}'")
-    snap = candidates[-1]
+    snap = select_restore_snapshot(store, manifest, profile_name, snapshot_id)
 
     store.restore(snap.id, target=Path(root))
     run_hooks(layout, "post-sync", {"snapshot": snap.id}, root=root)

@@ -45,11 +45,11 @@ dev:
 
 lint:
 	@command -v ruff >/dev/null || { echo "ruff not installed; run 'make dev' first"; exit 1; }
-	ruff check src tests
+	ruff check porta_winux test/unit
 
 unit:
 	@command -v pytest >/dev/null || { echo "pytest not installed; run 'make dev' first"; exit 1; }
-	$(PY) -m pytest tests/ -q
+	$(PY) -m pytest test/unit/ -q
 
 smoke:
 	@command -v restic >/dev/null || { echo "restic not installed (dnf install restic)"; exit 1; }

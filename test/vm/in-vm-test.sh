@@ -12,10 +12,10 @@ bash "$SRC/test/smoke.sh"
 
 # Tier 2: auto-detection (no --drive flag, no env) against the mounted disk
 rm -rf "$DRIVE/repo" "$DRIVE/workspace"
-export PYTHONPATH="$SRC/src"
+export PYTHONPATH="$SRC"
 export PORTA_WINUX_STATE_DIR=/tmp/porta-winux-vm-state
 export USER=test
-python3 -m porta_winux.cli init-drive "$DRIVE" --password vmtest >/dev/null
+python3 -m porta_winux.cli --yes init-drive "$DRIVE" --password vmtest >/dev/null
 mkdir -p /tmp/vmsys/home/test
 echo data > /tmp/vmsys/home/test/f.txt
 python3 -m porta_winux.cli --root /tmp/vmsys snapshot -p home   # note: no --drive

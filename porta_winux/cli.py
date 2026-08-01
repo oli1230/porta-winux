@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from . import PortaWinuxError, __version__
+from . import interact
 from .manifest import MANIFEST_NAME, DriveLayout, find_drive
 from .store import ResticStore
 from . import sync as syncmod
@@ -25,18 +26,53 @@ def _layout_store(args) -> tuple[DriveLayout, ResticStore]:
 
 
 def cmd_init_drive(args) -> int:
-    root = Path(args.path).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    # 1. Where? Prefer an interactive pick over a typed path a human can get wrong.
+    if args.path:
+        root = Path(args.path).resolve()
+    else:
+        cands = interact.removable_mount_candidates()
+        chosen = interact.choose(
+            "Which mounted drive should become the porta-winux drive?",
+            cands,
+            allow_other="type a path manually",
+        )
+        root = Path(chosen).resolve()
+
+    # 2. Show exactly what will happen before anything is written.
     layout = DriveLayout(root=root)
+    already = layout.manifest_path.exists()
+    print(f"\nPlan for {root}:")
+    if already:
+        print(f"  - {MANIFEST_NAME} already present: existing files will NOT be overwritten")
+    else:
+        print(f"  - copy drive template: {MANIFEST_NAME}, hooks.d/, bootstrap.sh, bin/")
+    print("  - create workspace/root/ (editable checkout area)")
+    if layout.password_file.exists():
+        print("  - .restic-pass already present: kept as-is")
+    elif args.password:
+        print("  - write your provided password to .restic-pass (mode 600)")
+    else:
+        print("  - generate a random repo password into .restic-pass (mode 600)")
+    if (layout.repo / "config").exists():
+        print("  - repo/ already initialized: left untouched")
+    else:
+        print("  - initialize an empty restic repository in repo/")
+    print("  - nothing outside this directory is touched\n")
+    interact.confirm(f"Initialize porta-winux drive at {root}?", assume_yes=args.yes)
+
+    root.mkdir(parents=True, exist_ok=True)
 
     # Template ships inside the package so pip-installed copies work too.
     template = Path(__file__).resolve().parent / "drive_template"
     if not layout.manifest_path.exists():
         if template.is_dir():
             shutil.copytree(template, root, dirs_exist_ok=True)
-            # Wheel installs strip executable bits; restore them.
+            # Wheel installs strip executable bits; restore them — but only
+            # on real programs (shebang/ELF), never READMEs or placeholders.
+            from .hooks import _is_runnable
+
             for exe in [root / "bootstrap.sh", *(root / "hooks.d").rglob("*")]:
-                if exe.is_file() and exe.name != ".keep":
+                if exe.is_file() and _is_runnable(exe):
                     exe.chmod(exe.stat().st_mode | 0o755)
         else:
             layout.manifest_path.write_text(_FALLBACK_MANIFEST)
@@ -57,9 +93,10 @@ def cmd_init_drive(args) -> int:
     store = ResticStore(layout)
     if not (layout.repo / "config").exists():
         store.init()
-    print(f"initialized porta-winux drive at {root}")
-    print(f"edit {layout.manifest_path} to define what gets backed up, then run:")
-    print(f"  porta-winux --drive {root} snapshot")
+    print(f"\ninitialized porta-winux drive at {root}")
+    print("next step — tell porta-winux WHAT to back up:")
+    print(f"  1. edit {layout.manifest_path}  (add your paths under [profiles.*])")
+    print(f"  2. porta-winux --drive {root} snapshot")
     return 0
 
 
@@ -142,11 +179,28 @@ def cmd_commit(args) -> int:
 def cmd_sync(args) -> int:
     layout, store = _layout_store(args)
     manifest = layout.load_manifest()
+
+    # Always compute the plan first and show it.
+    plan = syncmod.sync(store, layout, manifest, root=args.root, force=args.force, dry_run=True)
+    if not (plan.written or plan.conflicts or plan.skipped_same):
+        print("nothing to sync")
+        return 0
+    print(f"sync plan (target root: {args.root}):")
+    syncmod.print_sync_result(plan)
+    if args.dry_run:
+        return 1 if plan.conflicts and not args.force else 0
+    if plan.written:
+        interact.confirm(
+            f"Write {len(plan.written)} file(s) to {args.root} "
+            "(a safety snapshot is taken first)?",
+            assume_yes=args.yes,
+        )
+
     result = syncmod.sync(
-        store, layout, manifest, root=args.root, force=args.force, dry_run=args.dry_run
+        store, layout, manifest, root=args.root, force=args.force, dry_run=False
     )
     syncmod.print_sync_result(result)
-    if result.applied_commits and not args.dry_run and not args.no_snapshot:
+    if result.applied_commits and not args.no_snapshot:
         snap = syncmod.take_system_snapshot(store, layout, manifest, None, root=args.root)
         state = syncmod.HostState.load(store.repo_id())
         state.base_snapshot = snap
@@ -157,6 +211,10 @@ def cmd_sync(args) -> int:
 
 def cmd_revert(args) -> int:
     layout, store = _layout_store(args)
+    scope = ", ".join(args.paths) if args.paths else "every path in the snapshot"
+    print(f"revert plan: restore {scope} from snapshot {args.snapshot} onto {args.root}")
+    print("a safety snapshot of the current state is taken first")
+    interact.confirm("Proceed with revert?", assume_yes=args.yes)
     safety = syncmod.revert(store, layout, args.snapshot, args.paths or None, root=args.root)
     if safety:
         print(f"pre-revert safety snapshot: {safety[:8]}")
@@ -167,8 +225,15 @@ def cmd_revert(args) -> int:
 def cmd_restore_full(args) -> int:
     layout, store = _layout_store(args)
     manifest = layout.load_manifest()
+    snap = syncmod.select_restore_snapshot(store, manifest, args.profile, args.snapshot)
+    print(
+        f"restore plan: lay down system snapshot {snap.short_id} "
+        f"({snap.time[:19]}, host {snap.hostname}) onto {args.root}"
+    )
+    print("existing files at those paths WILL be overwritten")
+    interact.confirm("Proceed with full restore?", assume_yes=args.yes)
     snap = syncmod.restore_full(
-        store, layout, manifest, args.profile, root=args.root, snapshot_id=args.snapshot
+        store, layout, manifest, args.profile, root=args.root, snapshot_id=snap.id
     )
     print(f"restored system snapshot {snap.short_id} ({snap.time[:19]}) onto {args.root}")
     return 0
@@ -190,6 +255,9 @@ def cmd_verify(args) -> int:
 
 def cmd_prune(args) -> int:
     layout, store = _layout_store(args)
+    print(f"prune plan: PERMANENTLY delete system/safety snapshots beyond the "
+          f"newest {args.keep_last} (commits are never pruned)")
+    interact.confirm("Proceed with prune?", assume_yes=args.yes)
     store.forget(keep_last=args.keep_last)
     print(f"pruned; kept last {args.keep_last} system snapshots (all commits retained)")
     return 0
@@ -250,11 +318,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="/",
         help="target system root (default /; point at a sandbox dir for testing)",
     )
+    p.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="skip confirmation prompts (for scripts, kickstart, CI)",
+    )
     p.add_argument("--version", action="version", version=f"porta-winux {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init-drive", help="turn a directory/mounted drive into a porta-winux drive")
-    s.add_argument("path")
+    s.add_argument("path", nargs="?", help="drive root (interactive picker if omitted)")
     s.add_argument("--password", help="repo password (default: generate and store on drive)")
     s.set_defaults(func=cmd_init_drive)
 
