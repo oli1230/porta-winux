@@ -1,81 +1,179 @@
-# porta-winux (Linux/Fedora scope)
+# porta-winux
 
-Backup + sync system for two Fedora machines (desktop, laptop) sharing one
-external drive that gets physically moved between them. Windows-side work
-is deferred; the Ansible layer is written to extend to it later.
+Back up a Linux system to an external hard drive, browse and **edit** those
+backups from any other PC, sync the edits back, revert to any earlier
+state, and rebuild a fresh machine from the drive — all on top of a single
+deduplicated, encrypted [restic](https://restic.readthedocs.io/) repository.
 
-## Core design principle
-
-**Automatic actions are read-only or additive. Anything that installs,
-overwrites, or deletes requires a human to run it on purpose.**
-
-- Automatic on drive-attach (`scripts/drive_handler.sh`): gather software
-  facts, ledger-aware live sync, borgmatic backup, periodic integrity check.
-- Manual-only: `ansible/playbooks/ensure_packages.yml` (installs software),
-  `ledger_sync.py --resolve push|pull` (forces a conflict resolution),
-  `--allow-delete` on the sync (off by default).
-
-## Layout
+Think *git semantics over a backup store*: snapshots are your history,
+edits made anywhere become commits, and any machine can fast-forward,
+revert, or bootstrap itself from scratch.
 
 ```
-manifest/manifest.yaml       <- single source of truth: what gets backed up/synced, per host
-manifest/packages/*.yml      <- auto-generated software inventory, per host (commit these)
-borgmatic/templates/         <- Jinja2 template borgmatic configs are rendered from
-borgmatic/generated/         <- output of render_borgmatic_config.py (gitignore-able, regenerated each run)
-scripts/
-  render_borgmatic_config.py <- manifest.yaml -> borgmatic/generated/<host>.yaml
-  ledger_sync.py             <- conflict-aware rsync between local folders and drive's /LiveSync
-  drive_handler.sh           <- orchestrator; this is what systemd actually runs
-ansible/
-  playbooks/gather_facts.yml     <- read-only, safe to automate
-  playbooks/ensure_packages.yml  <- installs stuff, manual-only
-systemd/borg-drive-handler@.service
-udev/99-backup-drive.rules
+                 snapshot                    checkout
+  your machine ─────────────►  external ◄───────────────  any PC
+  (Fedora)     ◄─────────────    drive  ───────────────►  (edit, commit)
+                sync / revert   (restic repo + workspace)
+                restore-full
 ```
 
-## One-time setup per machine
+## Safety model (read this first)
 
-Check what's missing, then install only that, with confirmation at each step:
+**porta-winux never writes or deletes data without asking you.** Every
+operation that touches a system or removes snapshots (`init-drive`, `sync`,
+`revert`, `restore-full`, `prune`) first prints a concrete plan — what,
+where — and waits for your explicit yes. Purely additive operations
+(`snapshot`, `checkout`, `commit`) don't prompt, because they can't destroy
+anything. On top of that, every sync/revert automatically snapshots the
+current state of the affected files *first*, so undoing a bad decision is
+always one `revert` away. For scripts, kickstart, and CI, `--yes` skips the
+prompts; with no terminal attached and no `--yes`, commands refuse rather
+than guess.
+
+## Initial setup, step by step
+
+**1. Install the two things it needs** — restic and porta-winux itself:
+
 ```bash
-git clone https://github.com/oli1230/porta-winux.git ~/porta-winux
-cd ~/porta-winux
-make check          # reports missing dnf packages, installs nothing
-make install-deps   # installs only what's missing, asks first
-make check-collection
-make install-collection
-
-# Edit `manifest/manifest.yaml` to add this host under `hosts:` with its
-# actual paths.
-
-make detect-uuid       # drive plugged in; writes UUID into manifest.yaml, asks first
-make install-udev-rule # renders the rule with that UUID, installs/updates under /etc, asks first
-make install-service   # installs/updates the systemd unit, asks first
-make borg-init         # inits the repo on the drive, only if one isn't already there
+sudo dnf install restic          # the backup engine
+make install                     # puts the 'porta-winux' command on your PATH
+make doctor                      # checks everything is in place, tells you what's optional
 ```
 
-## Trigger reliability note
+**2. Plug in your external drive** and note where Fedora mounted it
+(usually `/run/media/<you>/<label>` — check with `df` or your file manager).
 
-The udev rule fires on device *arrival*, before udisks2 necessarily finishes
-mounting it to `/run/media/$USER/<label>`. That's handled: `drive_handler.sh`
-calls `scripts/check_drive_mounted.sh`, which polls (default 30s) for the
-mount to appear and, if `drive.expected_uuid` is set, verifies it's actually
-the right physical drive before doing anything else — otherwise it fails
-fast with a clear error rather than writing to the wrong place.
+**3. Turn it into a porta-winux drive:**
 
-## Restoring a machine from scratch
+```bash
+porta-winux init-drive
+```
 
-1. Fresh Fedora install.
-2. `git clone` this repo, install the one-time-setup packages above.
-3. `ansible-playbook ansible/playbooks/ensure_packages.yml --extra-vars "target_host=<host>" --ask-become-pass`
-   — reinstalls your software from the last committed manifest.
-4. `borgmatic -c borgmatic/generated/<host>.yaml restore ...` (or `borg extract`)
-   for your actual data, once the drive is attached and the config is
-   regenerated.
+With no path given it lists the mounted drives it can find and lets you
+pick from a menu (you can also pass the path directly). It then shows you
+exactly what it will create — manifest, empty restic repository, workspace,
+hooks — and asks before writing anything.
 
-## What's intentionally not built yet
+**4. Tell it what to back up — this step is yours, don't skip it.**
+Open `<drive>/porta-winux.toml` in any editor. The shipped defaults are
+just examples. A profile is a name plus the paths you want backed up:
 
-- Windows side (native Borg fork evaluation, Ansible `win_*` modules) —
-  revisit once this Linux path is solid.
-- Off-drive redundancy (this whole system has one physical copy; consider
-  an occasional `borg` push to a remote/cloud repo for the truly
-  irreplaceable subset of `manifest.yaml`).
+```toml
+[porta-winux]
+default_profile = "mine"
+
+[profiles.mine]
+paths = [
+  "/home/you",            # your files
+  "/etc/nginx",           # a config you care about
+  "/usr/local/bin",       # your scripts
+]
+excludes = [
+  "**/.cache",            # never worth backing up
+  "**/node_modules",
+  "**/*.iso",             # huge and re-downloadable
+]
+```
+
+(TOML syntax reference: https://toml.io/en/ — but the pattern above is
+really all you need.)
+
+**5. Take your first backup and check it:**
+
+```bash
+porta-winux snapshot          # backs up the default profile
+porta-winux list              # your snapshot, with id and time
+porta-winux ls latest         # every file inside it
+porta-winux verify            # cryptographic integrity check of the repo
+```
+
+That's it — from here on, `porta-winux snapshot` whenever you want a
+restore point (or from a cron/systemd timer with `--yes`).
+
+## Everyday use
+
+```bash
+# On any other PC (plug in drive; ./bootstrap.sh on the drive = zero-install):
+porta-winux browse                    # TUI: fuzzy-find a file, preview, Enter = edit
+porta-winux mount /tmp/snap           # or FUSE-mount everything and use any tool
+porta-winux checkout /home/you/.bashrc
+$EDITOR <drive>/workspace/root/home/you/.bashrc
+porta-winux commit -m "tweak aliases"
+
+# Back on your machine:
+porta-winux sync                      # shows the plan, asks, applies commits
+porta-winux list                      # history of snapshots and commits
+porta-winux revert <snap-id> [paths]  # time-travel (safety snapshot taken first)
+
+# On a brand-new Fedora install:
+porta-winux restore-full              # lay down your latest backup
+porta-winux prune --keep-last 10      # thin old snapshots (commits always kept)
+```
+
+If both a commit and your local machine changed the same file, `sync`
+flags a **conflict** and touches nothing — you decide (edit locally and
+re-sync, or `sync --force` to take the drive's version).
+
+Every command accepts `--root /some/dir` to operate on a sandbox directory
+instead of the real `/` — great for experimenting without risk, and how the
+test suite works.
+
+## What's in this repository
+
+Each folder has its own README explaining its files and the technology
+behind them:
+
+| folder | contents |
+|--------|----------|
+| [`porta_winux/`](porta_winux/README.md) | the Python package — module map and design rules |
+| [`porta_winux/drive_template/`](porta_winux/drive_template/README.md) | what ends up on your drive, file by file |
+| [`porta_winux/drive_template/hooks.d/`](porta_winux/drive_template/hooks.d/README.md) | **what hooks are, from scratch**, and why they exist |
+| [`test/`](test/README.md) | the three test tiers and when to run each |
+| [`test/vm/`](test/vm/README.md) | the VM harness: libvirt, cloud-init, the fake external drive |
+| [`test/container/`](test/container/README.md) | the fast containerized tier |
+
+## Extending it later (the modularity story)
+
+Three mechanisms carry the roadmap (ansible integration, kickstart,
+Windows sync, security scans, compression middleware) without touching the
+core:
+
+1. **hooks** — drop a script on the drive, it runs at the right moment.
+   Full explanation: [`hooks.d/README.md`](porta_winux/drive_template/hooks.d/README.md).
+2. **profiles** in `porta-winux.toml` — new machines or OS slices are just
+   more profiles.
+3. **`SnapshotStore`** ([`porta_winux/store.py`](porta_winux/README.md)) —
+   the only code that knows restic exists; a future borg/kopia backend is
+   one class. restic was chosen over borg specifically for native Windows
+   support down the road.
+
+Kickstart already works today: in `%post`, mount the drive and run
+`porta-winux --yes --drive /mnt/drive restore-full`.
+
+### Known v1 limitations (deliberate)
+
+- Commits carry adds/edits only — deletions can't be staged yet.
+- Conflict resolution is whole-file (keep local or take remote), no merging.
+- uid/gid mapping across machines is future work; SELinux labels are
+  handled by the shipped restorecon hook.
+- One workspace at a time: commit before checking out an unrelated set.
+
+## Testing
+
+```bash
+make doctor           # dependency check with install hints
+make test             # unit tests + full end-to-end cycle in a /tmp sandbox
+make container-test   # same cycle in a pristine Fedora 43 container (podman)
+make vm-up vm-test    # real Fedora 43 VM with a simulated external drive
+make vm-wipe          # instant clean slate for a retest
+```
+
+Details and background links in [`test/README.md`](test/README.md).
+
+## Security notes
+
+- The repo password lives on the drive (`.restic-pass`) so foreign PCs work
+  with zero setup — which trades away theft protection. The drive's README
+  explains the alternative.
+- `/etc/shadow*` is excluded by the sample `etc` profile on purpose.
+- Syncing/restoring system paths needs `sudo porta-winux …`.

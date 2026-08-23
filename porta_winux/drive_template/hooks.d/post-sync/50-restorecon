@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fedora/SELinux: restore security contexts on files porta-winux just wrote.
+# Receives affected paths (newline-separated) in $PORTA_WINUX_PATHS.
+set -u
+command -v restorecon >/dev/null || exit 0
+[ "${PORTA_WINUX_ROOT:-/}" = "/" ] || exit 0   # skip in sandboxed test runs
+[ -n "${PORTA_WINUX_PATHS:-}" ] || exit 0
+printf '%s\n' "$PORTA_WINUX_PATHS" | while IFS= read -r p; do
+  [ -n "$p" ] && restorecon -F "$p" 2>/dev/null
+done
+exit 0
