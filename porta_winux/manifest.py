@@ -95,10 +95,29 @@ class DriveLayout:
     def bin_dir(self) -> Path:
         return self.root / "bin"
 
+    @property
+    def configs_path(self) -> Path:
+        return self.root / "configs.toml"
+
     def load_manifest(self) -> Manifest:
         if not self.manifest_path.exists():
             raise DriveNotFound(f"no {MANIFEST_NAME} at {self.root}")
-        return Manifest.load(self.manifest_path)
+        m = Manifest.load(self.manifest_path)
+        # Designated configs (from `pkg scan-configs` + `pkg adopt`) become a
+        # normal profile, so snapshot/checkout/commit/sync all just work on them.
+        if self.configs_path.exists():
+            with open(self.configs_path, "rb") as f:
+                data = tomllib.load(f).get("configs", {})
+            paths = list(data.get("etc_paths", [])) + list(data.get("user_paths", []))
+            if paths:
+                prof = Profile(
+                    name="system-configs",
+                    paths=paths,
+                    excludes=list(data.get("excludes", [])),
+                )
+                prof.validate()
+                m.profiles["system-configs"] = prof
+        return m
 
 
 def find_drive(explicit: str | None) -> DriveLayout:

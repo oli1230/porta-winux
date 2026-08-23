@@ -25,7 +25,7 @@ $PORTA_WINUX_STATE_DIR) and records the last applied commit and the base
 system snapshot used for conflict detection.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.1"
 
 
 class PortaWinuxError(Exception):

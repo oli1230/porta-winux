@@ -4,6 +4,7 @@ GUIs should call the same library functions these commands do."""
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import shutil
 import sys
@@ -13,6 +14,7 @@ from . import PortaWinuxError, __version__
 from . import interact
 from .manifest import MANIFEST_NAME, DriveLayout, find_drive
 from .store import ResticStore
+from . import packages as pkgmod
 from . import sync as syncmod
 from . import workspace as ws
 
@@ -285,6 +287,128 @@ def cmd_browse(args) -> int:
     return run_browser(store, layout, snap)
 
 
+
+
+def cmd_pkg_scan(args) -> int:
+    layout = find_drive(args.drive)
+    current = pkgmod.PackageState.load(layout.root / pkgmod.PACKAGES_NAME)
+    scanned, notes = pkgmod.scan_system()
+    for n in notes:
+        print(f"note: {n}")
+
+    if args.capture_baseline:
+        path = pkgmod.write_baseline(
+            layout, scanned.dnf_packages,
+            f"host scan on Fedora {scanned.fedora_release or '?'}",
+        )
+        print(f"captured baseline of {len(scanned.dnf_packages)} packages -> {path}")
+        print("future scans (on any machine) subtract these from the draft")
+
+    baseline = pkgmod.load_baseline(layout)
+    raw_count = len(scanned.dnf_packages)
+    if baseline:
+        scanned.dnf_packages = [p for p in scanned.dnf_packages if p not in baseline]
+        print(f"baseline subtraction: {raw_count} -> {len(scanned.dnf_packages)} dnf candidates")
+
+    draft = layout.root / pkgmod.PACKAGES_DRAFT
+    draft.write_text(pkgmod.render_packages_draft(current, scanned))
+    new_dnf = len(set(scanned.dnf_packages) - set(current.dnf_packages))
+    new_fp = len({a["id"] for a in scanned.flatpak_apps} - {a["id"] for a in current.flatpak_apps})
+    print(f"scanned this host: {len(scanned.dnf_packages)} user-installed dnf packages "
+          f"({new_dnf} new vs list), {len(scanned.flatpak_apps)} flatpak apps ({new_fp} new), "
+          f"{len(scanned.dnf_repos)} non-default repos")
+    print(f"draft written (nothing else touched): {draft}")
+    print("review/edit it — delete anything you don't want synced — then: porta-winux pkg adopt")
+    return 0
+
+
+def cmd_pkg_scan_configs(args) -> int:
+    layout = find_drive(args.drive)
+    print("scanning rpm database for altered /etc config files (may take a minute)…")
+    try:
+        etc = pkgmod.scan_modified_etc()
+    except pkgmod.ScanUnavailable as e:
+        raise PortaWinuxError(f"config scan needs rpm: {e}")
+    if os.geteuid() != 0:
+        print("note: running unprivileged; some root-only files may be missed "
+              "(re-run with sudo for a complete scan)")
+    state = pkgmod.PackageState.load(layout.root / pkgmod.PACKAGES_NAME)
+    hints = pkgmod.user_config_hints(state)
+    draft = layout.root / pkgmod.CONFIGS_DRAFT
+    draft.write_text(pkgmod.render_configs_draft(etc, hints))
+    sens = sum(1 for p in etc if pkgmod.is_sensitive(p))
+    print(f"found {len(etc)} altered /etc config file(s) "
+          f"({sens} flagged SENSITIVE and left commented out), "
+          f"{len(hints)} suggested user config path(s) (all commented out)")
+    print(f"draft written: {draft}")
+    print("review/edit, then: porta-winux pkg adopt")
+    return 0
+
+
+def cmd_pkg_adopt(args) -> int:
+    layout = find_drive(args.drive)
+    plan = pkgmod.adopt_plan(layout)
+    if not plan:
+        print("no drafts on the drive; run 'pkg scan' / 'pkg scan-configs' first")
+        return 1
+    print("adopt plan (changes the lists on the drive only — installs nothing, removes nothing):")
+    for line in plan:
+        print("  " + line)
+    interact.confirm("Adopt draft(s) into the drive's designation files?", assume_yes=args.yes)
+    for name in pkgmod.adopt_execute(layout):
+        print(f"adopted {name}")
+    if (layout.root / pkgmod.CONFIGS_NAME).exists():
+        print("configs are now the 'system-configs' profile; snapshot them with:")
+        print("  sudo porta-winux snapshot -p system-configs")
+    return 0
+
+
+def cmd_pkg_diff(args) -> int:
+    layout = find_drive(args.drive)
+    plan = pkgmod.build_apply_plan(layout)
+    pkgmod.print_plan(plan)
+    return 0
+
+
+def cmd_pkg_apply(args) -> int:
+    layout = find_drive(args.drive)
+    plan = pkgmod.build_apply_plan(layout)
+    pkgmod.print_plan(plan)
+    if not plan.has_work:
+        print("nothing to install — this machine already has everything in the list")
+        return 0
+    if args.dry_run:
+        print("dry run — the exact commands a real apply would run:")
+        pkgmod.apply_dnf(plan.dnf_to_install, dry_run=True)
+        pkgmod.apply_flatpak(plan.remotes_to_add, plan.flatpak_to_install, dry_run=True)
+        print("(nothing was executed)")
+        return 0
+    failed: list[str] = []
+    if plan.dnf_to_install:
+        interact.confirm(
+            f"Install {len(plan.dnf_to_install)} dnf package(s) via "
+            f"'{'sudo ' if os.geteuid() else ''}dnf install' (install only, never removes)?",
+            assume_yes=args.yes,
+        )
+        failed += pkgmod.apply_dnf(plan.dnf_to_install, dry_run=False)
+    if plan.remotes_to_add or plan.flatpak_to_install:
+        interact.confirm(
+            f"Add {len(plan.remotes_to_add)} flatpak remote(s) and install "
+            f"{len(plan.flatpak_to_install)} flatpak app(s)?",
+            assume_yes=args.yes,
+        )
+        failed += pkgmod.apply_flatpak(plan.remotes_to_add, plan.flatpak_to_install, dry_run=False)
+    if plan.repos_missing:
+        print("reminder: these repos are still missing here (set them up, then re-run "
+              "'pkg apply'): " + ", ".join(plan.repos_missing))
+    if failed:
+        print(f"{len(failed)} item(s) failed to install: {', '.join(failed)}")
+        print("fix names/repos in packages.toml (or set up the missing repos) and re-run 'pkg apply'")
+        return 1
+    print("apply complete")
+    return 0
+
+
 # -- plumbing ----------------------------------------------------------------
 
 
@@ -386,6 +510,29 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("target")
     s.set_defaults(func=cmd_mount)
 
+    s = sub.add_parser(
+        "pkg",
+        help="user-designated programs & configs: scan, adopt, diff, apply (install-only)",
+    )
+    pkg_sub = s.add_subparsers(dest="pkg_cmd", required=True)
+    ps = pkg_sub.add_parser("scan", help="scan this host, write editable packages draft")
+    ps.add_argument(
+        "--capture-baseline",
+        action="store_true",
+        help="ALSO record this machine's package set as the fresh-install baseline "
+             "(run on a machine you haven't installed anything on yet)",
+    )
+    ps.set_defaults(func=cmd_pkg_scan)
+    ps = pkg_sub.add_parser("scan-configs", help="find altered /etc configs + user config suggestions")
+    ps.set_defaults(func=cmd_pkg_scan_configs)
+    ps = pkg_sub.add_parser("adopt", help="promote edited draft(s) to the drive's designation files")
+    ps.set_defaults(func=cmd_pkg_adopt)
+    ps = pkg_sub.add_parser("diff", help="desired list vs this machine (report only)")
+    ps.set_defaults(func=cmd_pkg_diff)
+    ps = pkg_sub.add_parser("apply", help="install what's missing here (staged, confirmed, NEVER removes)")
+    ps.add_argument("-n", "--dry-run", action="store_true")
+    ps.set_defaults(func=cmd_pkg_apply)
+
     s = sub.add_parser("browse", help="interactive fuzzy search / preview / edit (Textual)")
     s.add_argument("-s", "--snapshot", default="latest")
     s.set_defaults(func=cmd_browse)
@@ -400,6 +547,13 @@ def main(argv: list[str] | None = None) -> int:
     except PortaWinuxError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
+    except BrokenPipeError:
+        # Downstream pipe (grep -q, head, …) closed early: normal, not an error.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
     except KeyboardInterrupt:
         return 130
 
