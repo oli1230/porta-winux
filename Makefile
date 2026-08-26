@@ -1,11 +1,12 @@
 PY ?= python3
 USER_BIN := $(shell $(PY) -m site --user-base 2>/dev/null)/bin
 
-.PHONY: help doctor path install dev lint unit smoke pkg-smoke pkg-live test container-test \
+.PHONY: help bootstrap doctor path install dev lint unit smoke pkg-smoke pkg-live storage-smoke test container-test \
         vm-fetch vm-drive vm-up vm-ssh vm-push vm-test vm-wipe vm-destroy
 
 help:
 	@echo "porta-winux targets:"
+	@echo "  bootstrap       FRESH MACHINE: install system deps (dnf/apt) + porta-winux + PATH"
 	@echo "  doctor          check that required/optional dependencies are present"
 	@echo "  install         pip install (user site); warns if the bin dir isn't on PATH"
 	@echo "  path            add the pip user bin dir to your shell PATH (edits your shell rc)"
@@ -15,6 +16,7 @@ help:
 	@echo "  smoke           fast end-to-end test in a sandbox (needs restic)"
 	@echo "  pkg-smoke       full pkg scan/adopt/apply flow vs FAKE package managers"
 	@echo "  pkg-live        READ-ONLY pkg scans against this machine's real dnf/flatpak/rpm"
+	@echo "  storage-smoke   yank + corruption + (as root) loop-device format tests"
 	@echo "  test            unit + smoke"
 	@echo "  container-test  smoke test inside a clean Fedora 43 podman container"
 	@echo "  vm-up           create Fedora 43 test VM with fake external drive"
@@ -22,6 +24,12 @@ help:
 	@echo "  vm-ssh          shell into the VM"
 	@echo "  vm-wipe         delete VM + OS disk (base image kept) for a clean retest"
 	@echo "  vm-destroy      remove every VM artifact including base image"
+
+# One command from a bare OS to a working porta-winux. Delegates to the
+# script so it also works when `make` itself isn't installed yet:
+#     bash bootstrap-new-machine.sh
+bootstrap:
+	bash bootstrap-new-machine.sh
 
 doctor:
 	@echo "== required =="
@@ -102,7 +110,10 @@ pkg-smoke:
 pkg-live:
 	bash test/pkg-live.sh
 
-test: unit smoke pkg-smoke
+storage-smoke:
+	bash test/storage-smoke.sh
+
+test: unit smoke pkg-smoke storage-smoke
 
 container-test:
 	podman build -t porta-winux-test -f test/container/Containerfile .

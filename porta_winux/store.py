@@ -76,7 +76,7 @@ class SnapshotStore(ABC):
     def diff(self, a: str, b: str) -> list[DiffEntry]: ...
 
     @abstractmethod
-    def check(self) -> None: ...
+    def check(self, read_data: bool = False, subset: str | None = None) -> None: ...
 
     @abstractmethod
     def forget(self, keep_last: int, prune: bool = True) -> None: ...
@@ -221,8 +221,14 @@ class ResticStore(SnapshotStore):
                 entries.append(DiffEntry(action=msg["modifier"], path=msg["path"]))
         return entries
 
-    def check(self) -> None:
-        self._run("check")
+    def check(self, read_data: bool = False, subset: str | None = None) -> None:
+        args = ["check"]
+        if read_data:
+            args.append("--read-data")
+        elif subset:
+            args.append(f"--read-data-subset={subset}")
+        # stream output for long checks instead of buffering silently
+        self._run(*args, capture=False)
 
     def forget(self, keep_last: int, prune: bool = True) -> None:
         # Thin system and safety snapshots independently; never touch commits.

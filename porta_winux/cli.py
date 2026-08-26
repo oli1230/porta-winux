@@ -14,6 +14,7 @@ from . import PortaWinuxError, __version__
 from . import interact
 from .manifest import MANIFEST_NAME, DriveLayout, find_drive
 from .store import ResticStore
+from . import drivehealth
 from . import packages as pkgmod
 from . import sync as syncmod
 from . import workspace as ws
@@ -25,6 +26,27 @@ def _layout_store(args) -> tuple[DriveLayout, ResticStore]:
 
 
 # -- commands ----------------------------------------------------------------
+
+
+def _ensure_writable_root(root: Path, assume_yes: bool) -> None:
+    """Fresh btrfs/ext4 filesystems are root-owned; without this, init-drive
+    dies in Permission denied. Detect it and offer the chown."""
+    import getpass
+    import subprocess as sp
+    if not root.exists() or os.access(root, os.W_OK):
+        return
+    user = getpass.getuser()
+    print(
+        f"{root} exists but you can't write to it — freshly formatted Linux\n"
+        f"filesystems are owned by root until ownership is handed over."
+    )
+    interact.confirm(
+        f"Run 'sudo chown {user}:{user} {root}' to take ownership?", assume_yes=assume_yes
+    )
+    if sp.run(["sudo", "chown", f"{user}:{user}", str(root)]).returncode != 0:
+        raise PortaWinuxError(f"chown failed; fix ownership of {root} manually and re-run")
+    if not os.access(root, os.W_OK):
+        raise PortaWinuxError(f"{root} is still not writable after chown")
 
 
 def cmd_init_drive(args) -> int:
@@ -40,9 +62,11 @@ def cmd_init_drive(args) -> int:
         )
         root = Path(chosen).resolve()
 
+    _ensure_writable_root(root, assume_yes=args.yes)
+
     # 2. Show exactly what will happen before anything is written.
     layout = DriveLayout(root=root)
-    already = layout.manifest_path.exists()
+    already = manifest_preexisting = layout.manifest_path.exists()
     print(f"\nPlan for {root}:")
     if already:
         print(f"  - {MANIFEST_NAME} already present: existing files will NOT be overwritten")
@@ -92,9 +116,14 @@ def cmd_init_drive(args) -> int:
                 "      (you will then be prompted / must set RESTIC_PASSWORD)."
             )
 
+    if not manifest_preexisting:
+        pinned = drivehealth.pin_fstype(layout)
+        if pinned != "unknown":
+            print(f"pinned drive filesystem: {pinned} (writes refused if it ever differs)")
     store = ResticStore(layout)
     if not (layout.repo / "config").exists():
         store.init()
+    drivehealth.mark_clean(layout)
     print(f"\ninitialized porta-winux drive at {root}")
     print("next step — tell porta-winux WHAT to back up:")
     print(f"  1. edit {layout.manifest_path}  (add your paths under [profiles.*])")
@@ -104,6 +133,7 @@ def cmd_init_drive(args) -> int:
 
 def cmd_snapshot(args) -> int:
     layout, store = _layout_store(args)
+    drivehealth.guard_writes(layout, force=getattr(args, 'force', False))
     manifest = layout.load_manifest()
     snap = syncmod.take_system_snapshot(
         store, layout, manifest, args.profile, root=args.root
@@ -113,6 +143,7 @@ def cmd_snapshot(args) -> int:
     state = syncmod.HostState.load(store.repo_id())
     state.base_snapshot = snap
     state.save()
+    drivehealth.mark_clean(layout)
     print(f"created system snapshot {snap[:8]}")
     return 0
 
@@ -171,9 +202,11 @@ def cmd_status(args) -> int:
 
 def cmd_commit(args) -> int:
     layout, store = _layout_store(args)
+    drivehealth.guard_writes(layout, force=getattr(args, 'force', False))
     latest_system = [s for s in store.snapshots(tags=["system"])]
     base = latest_system[-1].id if latest_system else None
     snap = ws.commit(store, layout, args.message, base)
+    drivehealth.mark_clean(layout)
     print(f"committed as {snap[:8]}: {args.message}")
     return 0
 
@@ -198,6 +231,7 @@ def cmd_sync(args) -> int:
             assume_yes=args.yes,
         )
 
+    drivehealth.guard_writes(layout, force=args.force)
     result = syncmod.sync(
         store, layout, manifest, root=args.root, force=args.force, dry_run=False
     )
@@ -208,6 +242,7 @@ def cmd_sync(args) -> int:
         state.base_snapshot = snap
         state.save()
         print(f"post-sync system snapshot {snap[:8]} recorded as new base")
+    drivehealth.mark_clean(layout)
     return 1 if result.conflicts and not args.force else 0
 
 
@@ -217,9 +252,11 @@ def cmd_revert(args) -> int:
     print(f"revert plan: restore {scope} from snapshot {args.snapshot} onto {args.root}")
     print("a safety snapshot of the current state is taken first")
     interact.confirm("Proceed with revert?", assume_yes=args.yes)
+    drivehealth.guard_writes(layout)
     safety = syncmod.revert(store, layout, args.snapshot, args.paths or None, root=args.root)
     if safety:
         print(f"pre-revert safety snapshot: {safety[:8]}")
+    drivehealth.mark_clean(layout)
     print(f"reverted to {args.snapshot}")
     return 0
 
@@ -234,9 +271,11 @@ def cmd_restore_full(args) -> int:
     )
     print("existing files at those paths WILL be overwritten")
     interact.confirm("Proceed with full restore?", assume_yes=args.yes)
+    drivehealth.guard_writes(layout)
     snap = syncmod.restore_full(
         store, layout, manifest, args.profile, root=args.root, snapshot_id=snap.id
     )
+    drivehealth.mark_clean(layout)
     print(f"restored system snapshot {snap.short_id} ({snap.time[:19]}) onto {args.root}")
     return 0
 
@@ -250,8 +289,39 @@ def cmd_diff(args) -> int:
 
 def cmd_verify(args) -> int:
     layout, store = _layout_store(args)
-    store.check()
-    print("repository integrity OK")
+    fstype, target, _ = drivehealth.fs_info(layout.root)
+    pinned = drivehealth.pinned_fstype(layout)
+    state = drivehealth.session_state(layout)
+    print(f"drive: {target or layout.root}  fs={fstype}"
+          + (f" (pinned: {pinned})" if pinned else "  (fs not pinned in manifest)"))
+    if state == "dirty":
+        print("previous session ended UNCLEANLY — verifying before clearing the flag"
+              + ("" if args.deep else " (use --deep after a raw unplug)"))
+
+    print("tier 1: pack files vs their content hashes…")
+    bad = drivehealth.verify_packs(layout)
+    if bad:
+        drivehealth.mark_dirty(layout)  # block all writes until a verify passes
+        print(f"CORRUPTION: {len(bad)} pack file(s) do not hash to their names:",
+              file=sys.stderr)
+        for b in bad:
+            print(f"  {b}", file=sys.stderr)
+        print("do NOT run 'restic repair' reflexively — read STORAGE.md first.",
+              file=sys.stderr)
+        return 1
+
+    print("tier 2: restic check" + (" --read-data (full)…" if args.deep else "…"))
+    try:
+        store.check(read_data=args.deep)
+    except Exception:
+        drivehealth.mark_dirty(layout)  # block all writes until a verify passes
+        raise
+
+    drivehealth.mark_clean(layout)
+    if fstype == "btrfs" and args.deep:
+        print("btrfs tip: 'sudo btrfs scrub start -B " + (target or "<mount>") + "'"
+              " additionally verifies filesystem checksums")
+    print("repository integrity OK" + (" (deep)" if args.deep else ""))
     return 0
 
 
@@ -260,8 +330,55 @@ def cmd_prune(args) -> int:
     print(f"prune plan: PERMANENTLY delete system/safety snapshots beyond the "
           f"newest {args.keep_last} (commits are never pruned)")
     interact.confirm("Proceed with prune?", assume_yes=args.yes)
+    drivehealth.guard_writes(layout)
     store.forget(keep_last=args.keep_last)
+    drivehealth.mark_clean(layout)
     print(f"pruned; kept last {args.keep_last} system snapshots (all commits retained)")
+    return 0
+
+
+def cmd_format_drive(args) -> int:
+    notes = drivehealth.format_drive_checks(args.device)
+    subprocess_out = __import__("subprocess").run(
+        ["lsblk", "-o", "NAME,SIZE,FSTYPE,LABEL,MODEL", args.device],
+        capture_output=True, text=True).stdout
+    print(subprocess_out)
+    for n in notes:
+        print(n)
+    win_line = "  3  PW_WIN     rest    NTFS   reserved for a future Windows repo\n" \
+        if not args.no_win else ""
+    print(
+        f"This will DESTROY ALL DATA on {args.device} and create:\n"
+        f"  1  PW_SHARED  {args.shared}    exFAT  cross-platform human files\n"
+        f"  2  PW_LINUX   {args.linux if not args.no_win else 'rest'}   "
+        f"{args.fstype}  the repo — invisible to Windows (GPT type 8300)\n"
+        + win_line
+    )
+    if args.dry_run:
+        drivehealth.format_drive(args.device, args.shared, args.linux, args.fstype,
+                                 args.dup_data, not args.no_win, dry_run=True)
+        return 0
+    # Destructive formatting is interactive-only: --yes is deliberately NOT
+    # honored here, and the confirmation is typing the device path itself.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise PortaWinuxError("format-drive is interactive-only (no --yes bypass)")
+    typed = input(f"Type the device path ({args.device}) to confirm: ").strip()
+    if typed != args.device:
+        raise PortaWinuxError("confirmation did not match; nothing was changed")
+    p2 = drivehealth.format_drive(args.device, args.shared, args.linux, args.fstype,
+                                  args.dup_data, not args.no_win)
+    print(f"\ndone. Next steps:")
+    print(f"  1. unplug and replug the drive (KDE will mount PW_SHARED and PW_LINUX)")
+    print(f"  2. porta-winux init-drive        # pick the PW_LINUX mount from the menu")
+    print(f"     (init pins fstype={args.fstype}; writes are refused on anything else)")
+    print(f"  optional: stop auto-mounting the repo partition —")
+    print(f"     sudo cp setup/99-portawinux.rules /etc/udev/rules.d/ && sudo udevadm control --reload")
+    return 0
+
+
+def cmd_eject(args) -> int:
+    layout, _store = _layout_store(args)
+    drivehealth.eject(layout, force=args.force)
     return 0
 
 
@@ -457,6 +574,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("snapshot", help="take a system snapshot of a profile")
     s.add_argument("-p", "--profile")
+    s.add_argument("--force", action="store_true",
+                   help="write even after an unclean session (verify first instead!)")
     s.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("list", help="list snapshots (system + commits)")
@@ -476,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("commit", help="commit workspace edits as a new snapshot")
     s.add_argument("-m", "--message", required=True)
+    s.add_argument("--force", action="store_true",
+                   help="write even after an unclean session (verify first instead!)")
     s.set_defaults(func=cmd_commit)
 
     s = sub.add_parser("sync", help="apply pending commits to this system")
@@ -499,8 +620,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("b")
     s.set_defaults(func=cmd_diff)
 
-    s = sub.add_parser("verify", help="check repository integrity")
+    s = sub.add_parser("verify", help="check repo integrity (pack hashes + restic check)")
+    s.add_argument("--deep", action="store_true",
+                   help="full restic check --read-data (run after any unsafe unplug)")
     s.set_defaults(func=cmd_verify)
+
+    s = sub.add_parser(
+        "format-drive",
+        help="DESTRUCTIVE: partition a drive (exFAT shared / btrfs repo / NTFS reserved)",
+    )
+    s.add_argument("device", help="whole-disk device, e.g. /dev/sda")
+    s.add_argument("--shared", default="16G", help="PW_SHARED size (default 16G)")
+    s.add_argument("--linux", default="200G", help="PW_LINUX size (default 200G; ignored with --no-win)")
+    s.add_argument("--fstype", choices=["btrfs", "ext4"], default="btrfs")
+    s.add_argument("--dup-data", action="store_true",
+                   help="btrfs: store data twice (halves capacity, enables self-repair)")
+    s.add_argument("--no-win", action="store_true", help="skip the reserved Windows partition")
+    s.add_argument("-n", "--dry-run", action="store_true", help="print the exact commands only")
+    s.set_defaults(func=cmd_format_drive)
+
+    s = sub.add_parser("eject", help="sync, mark clean, unmount, power off: SAFE TO UNPLUG")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(func=cmd_eject)
 
     s = sub.add_parser("prune", help="thin old system snapshots (keeps all commits)")
     s.add_argument("--keep-last", type=int, default=10)

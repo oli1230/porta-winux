@@ -46,7 +46,7 @@ porta-winux pkg apply         # staged, confirmed installs
 ## How the noise problem is solved
 
 You never review 2,500 packages — but there's a Fedora subtlety: dnf's
-"user-installed" flag means "not a dependency", and **Anaconda marks the
+"user-installed" flag means "not a dependency", and **Anaconda (for example) marks the
 entire spin it installs that way** (on live installs, the whole baked-in
 package set). So a naive scan shows ~400 packages of spin baseline. Three
 mechanisms shrink it, layered from most to least precise:
