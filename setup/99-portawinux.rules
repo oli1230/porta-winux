@@ -1,0 +1,22 @@
+# /etc/udev/rules.d/99-portawinux.rules
+#
+# Stop GNOME/KDE/udisks from auto-mounting the porta-winux repo partitions at
+# /run/media/$USER/... with default mount options. porta-winux mounts them
+# itself, at a known path, with the options the repo actually needs.
+#
+# Without this you can end up with the same filesystem mounted twice under
+# different options, which is its own corruption hazard.
+#
+# PW_SHARED is deliberately NOT ignored -- that partition is meant to behave
+# like an ordinary USB stick and pop up in the file manager.
+#
+# Install:
+#     sudo cp setup/99-portawinux.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload
+#     sudo udevadm trigger --subsystem-match=block
+#
+# Verify (replug the drive, then):
+#     findmnt | grep -i portawinux     # should show nothing until pw-backup runs
+
+SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="PW_LINUX", ENV{UDISKS_IGNORE}="1"
+SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="PW_WIN",   ENV{UDISKS_IGNORE}="1"
