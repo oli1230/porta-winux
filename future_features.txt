@@ -1,0 +1,1 @@
+1. try atomic version of Fedora (maybe plan for atomic adoption, like currently atomic package managers and standards)
