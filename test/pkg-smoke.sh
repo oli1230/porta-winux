@@ -71,7 +71,7 @@ chmod +x "$FAKE"/*
 export PATH="$FAKE:$PATH"
 
 echo "== init drive"
-python3 -m porta_winux.cli --yes init-drive "$DRIVE" --password pkgtest >/dev/null
+python3 -m porta_winux.cli --yes init drive "$DRIVE" --password pkgtest >/dev/null
 
 echo "== machine A: pkg scan writes an annotated draft (and only the draft)"
 st pkg scan > "$TMP/scan.out"

@@ -11,7 +11,7 @@ import os
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -27,6 +27,17 @@ class Snapshot:
     hostname: str
     tags: list[str]
     paths: list[str]
+    username: str = ""
+    parent: str | None = None
+    summary: dict = field(default_factory=dict)  # restic's backup stats, if recorded
+
+    @property
+    def stats(self) -> str:
+        """Compact '+new ~changed' from restic's per-snapshot summary."""
+        if not self.summary:
+            return ""
+        n, c = self.summary.get("files_new", 0), self.summary.get("files_changed", 0)
+        return f"+{n} ~{c}"
 
     @property
     def is_commit(self) -> bool:
@@ -69,8 +80,26 @@ class SnapshotStore(ABC):
 
     @abstractmethod
     def restore(
-        self, snapshot_id: str, target: Path, includes: list[str] | None = None
-    ) -> None: ...
+        self, snapshot_id: str, target: Path, includes: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> None:
+        """Lay a snapshot down under `target`, never deleting anything.
+
+        Deliberately NOT exposing restic's `restore --delete`: it mirrors the
+        whole --target directory against the snapshot tree, so with
+        --target / it would remove every top-level entry the snapshot lacks
+        (/etc, /usr, ...). Scoping it with --include is safe but forbids
+        --exclude, which we need to protect never-backed-up paths. Mirror
+        semantics live in sync.restore(), which deletes an explicit list."""
+
+    @abstractmethod
+    def tree(self, snapshot_id: str, path: str) -> list[dict]:
+        """Direct children of a directory inside a snapshot, with content
+        hashes (`content`) for files and `subtree` ids for directories."""
+
+    @abstractmethod
+    def unlock(self) -> None:
+        """Remove stale repository locks."""
 
     @abstractmethod
     def diff(self, a: str, b: str) -> list[DiffEntry]: ...
@@ -187,6 +216,9 @@ class ResticStore(SnapshotStore):
                 hostname=s.get("hostname", ""),
                 tags=s.get("tags") or [],
                 paths=s.get("paths") or [],
+                username=s.get("username", ""),
+                parent=s.get("parent"),
+                summary=s.get("summary") or {},
             )
             for s in out
         ]
@@ -208,11 +240,26 @@ class ResticStore(SnapshotStore):
             )
         return proc.stdout
 
-    def restore(self, snapshot_id: str, target: Path, includes: list[str] | None = None) -> None:
+    def restore(
+        self, snapshot_id: str, target: Path, includes: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> None:
         args = ["restore", snapshot_id, "--target", str(target)]
         for inc in includes or []:
             args += ["--include", inc]
+        if dry_run:
+            args.append("--dry-run")
         self._run(*args)
+
+    def tree(self, snapshot_id: str, path: str) -> list[dict]:
+        proc = self._run("cat", "tree", f"{snapshot_id}:{path}")
+        try:
+            return json.loads(proc.stdout).get("nodes") or []
+        except json.JSONDecodeError as e:
+            raise StoreError(f"unreadable tree for {snapshot_id[:8]}:{path}: {e}") from e
+
+    def unlock(self) -> None:
+        self._run("unlock")
 
     def diff(self, a: str, b: str) -> list[DiffEntry]:
         entries: list[DiffEntry] = []

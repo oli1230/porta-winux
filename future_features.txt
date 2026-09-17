@@ -1,1 +1,16 @@
 1. try atomic version of Fedora (maybe plan for atomic adoption, like currently atomic package managers and standards)
+2. allow init-drive to soft-install, make sure an existing drive can be used with a new folder instead of overwriting any data already on a drive
+
+
+You and I have been working on creating a program that fits the description of this project, here is the repo we (you) have built: https://github.com/oli1230/porta-winux. I would like to start this session by discussing ways we can simplify (or simply explain to me) the system we have, as well as add some new features. For context, i've aliased the prota-winux command to pw
+
+questions/simplifications:
+
+
+
+
+
+what does the whole commit checkout system do? I was unable to get this to work in any helpful ways, I simply have added a snapshot with "pw snapshot" and it updates the external drive. When I then do a "pw sync" on the laptop (after a "pw list" verifies it's there"), it says "nothing to sync"? I took a snapshot of the laptop, then had to use git revert to update my laptop with the changes from the desktop (I did this out of order, but the commands to fix it should be easily usable). I believe the expected behavior of sync is to sync from the latest snapshot of the other system, not just the latest snapshot.
+
+
+

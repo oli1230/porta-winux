@@ -24,7 +24,7 @@ st() { python3 -m porta_winux.cli --drive "$DRIVE" "$@"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 mkdir -p "$SYS/home/u"; echo data1 > "$SYS/home/u/f.txt"
-python3 -m porta_winux.cli --yes init-drive "$DRIVE" --password stest >/dev/null
+python3 -m porta_winux.cli --yes init drive "$DRIVE" --password stest >/dev/null
 grep -q "expected_fstype" "$DRIVE/porta-winux.toml" || fail "init did not pin fstype"
 
 echo "== act 1: simulated yank mid-operation =="
@@ -70,12 +70,12 @@ else
   LOOPDEV=$(losetup -f --show -P "$TMP/fakedisk.img")
   echo "   fake drive: $LOOPDEV"
   # dry-run prints, executes nothing
-  python3 -m porta_winux.cli format-drive "$LOOPDEV" \
+  python3 -m porta_winux.cli init format "$LOOPDEV" \
       --shared 256M --linux 1G -n | grep -q "DRY-RUN" || fail "dry-run silent"
   blkid "${LOOPDEV}p1" 2>/dev/null && fail "dry-run formatted something"
   # real run, feeding the typed confirmation through a pty
   printf '%s\n' "$LOOPDEV" | script -qec \
-    "python3 -m porta_winux.cli format-drive $LOOPDEV --shared 256M --linux 1G" \
+    "python3 -m porta_winux.cli init format $LOOPDEV --shared 256M --linux 1G" \
     /dev/null >/dev/null
   { partprobe "$LOOPDEV" 2>/dev/null || partx -u "$LOOPDEV" || true; }; sleep 1
   # blkid -p probes devices directly (lsblk needs a udev daemon to see labels)
@@ -88,7 +88,7 @@ else
     || fail "PW_LINUX is not GPT type 8300 (Windows would offer to format it!)"
   echo "   layout verified: labels, filesystems, and the 8300 type GUID"
   # passing a PARTITION must be caught with a pointer to the whole disk
-  if OUT=$(python3 -m porta_winux.cli format-drive "${LOOPDEV}p1" -n 2>&1); then
+  if OUT=$(python3 -m porta_winux.cli init format "${LOOPDEV}p1" -n 2>&1); then
     fail "format-drive accepted a partition"
   fi
   echo "$OUT" | grep -q "PARTITION" || fail "partition mistake not explained"
@@ -96,7 +96,7 @@ else
   # a mounted partition must be named with an unmount command
   MNT=$(mktemp -d)
   if mount "${LOOPDEV}p2" "$MNT" 2>/dev/null; then
-    if OUT=$(python3 -m porta_winux.cli format-drive "$LOOPDEV" -n 2>&1); then
+    if OUT=$(python3 -m porta_winux.cli init format "$LOOPDEV" -n 2>&1); then
       umount "$MNT"; fail "format-drive accepted a disk with mounted partitions"
     fi
     umount "$MNT"

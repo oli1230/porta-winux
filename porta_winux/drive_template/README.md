@@ -1,11 +1,13 @@
 # the porta-winux drive
 
 This directory tree is copied onto a new external drive by
-`porta-winux init-drive` (which shows you a plan and asks first).
+`porta-winux init drive` (which shows you a plan and asks first).
 
 | entry | what it is |
 |-------|-----------|
-| `porta-winux.toml` | **the manifest — the file you edit.** Profiles = named lists of paths to back up, with excludes. Its presence is also what marks a directory as a porta-winux drive. TOML syntax: https://toml.io/en/ |
+| `.porta-winux`     | the signature (JSON): a drive id, when/where/with which version it was created. This is what marks a directory as a porta-winux drive; `porta-winux init detect` reads it. |
+| `porta-winux.toml` | **the manifest — the file you edit.** Profiles = named lists of paths to back up, with excludes. TOML syntax: https://toml.io/en/ |
+| `.pw-state/`       | the clean-session marker (see STORAGE.md) and `journal.jsonl`, the operation log behind `porta-winux log`. |
 | `repo/`            | the restic repository holding every snapshot, deduplicated and encrypted. Never edit by hand. https://restic.readthedocs.io/ |
 | `.restic-pass`     | the repo password (mode 600). See security note below. |
 | `workspace/root/`  | the editable area: `checkout` puts files here mirrored by absolute path (`/home/you/x` → `workspace/root/home/you/x`), you edit them, `commit` snapshots them back. |

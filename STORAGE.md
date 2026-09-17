@@ -95,7 +95,7 @@ change `PW_EXPECTED_FSTYPE` in `pw.conf` to match.
 
 (The original response to this incident was a standalone pw-backup/pw-verify
 toolset. It was integrated INTO porta-winux instead, so that every write path
-— snapshot, commit, sync, revert, restore-full, prune — inherits the guards,
+— snapshot, commit, sync, restore, prune — inherits the guards,
 not just a parallel backup command. Deltas from the standalone design: the
 tool accepts whatever mount point the desktop chose and asserts the FILESYSTEM
 rather than fighting the automounter; btrfs defaults to `-m dup` (metadata
@@ -104,7 +104,7 @@ and the repo password stays on the drive per the project's documented
 zero-install tradeoff. The udev rule survives as an optional extra in setup/.)
 
 ### The regression guard
-`[storage] expected_fstype` is pinned in porta-winux.toml by init-drive.
+`[storage] expected_fstype` is pinned in porta-winux.toml by `init drive`.
 Every write refuses if the drive is mounted as anything else, with a specific
 lecture for fuseblk/ntfs-3g. On unpinned drives, risky filesystems (ntfs*,
 exfat, vfat, fuseblk) draw a loud warning.
@@ -123,7 +123,7 @@ on day one) + restic check. `verify --deep` adds --read-data; run it after
 any unsafe unplug. On btrfs, --deep also prints the scrub command.
 
 ### Formatting a drive
-`porta-winux format-drive /dev/sdX` creates the three-partition layout above.
+`porta-winux init format /dev/sdX` creates the three-partition layout above.
 It is deliberately interactive-only: --yes is NOT honored, and confirmation
 is typing the device path. `--dry-run` prints the exact commands.
 `--fstype ext4`, `--dup-data`, `--no-win`, `--shared`/`--linux` adjust it.

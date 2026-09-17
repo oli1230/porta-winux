@@ -1,5 +1,5 @@
 """Sync engine: bring a live system up to date with commits made on the
-drive, revert to earlier states, and perform full restores.
+drive, and restore earlier states (partial or whole) onto it.
 
 Host state (~/.local/state/porta-winux/<repo-id>.json):
     base_snapshot   system snapshot representing this host's last known state
@@ -11,8 +11,9 @@ Conflict rule for applying a commit's file F:
     otherwise                    -> conflict (local changed since base);
                                     skipped unless --force
 
-Every sync/revert takes a safety snapshot of the affected paths first, so
-"undo the sync" is always just another revert.
+Every sync/restore takes a safety snapshot of the affected paths first, so
+"undo the sync" is always just another restore. Safety and result snapshots
+carry the same op:<id> tag (see ops.py), so they can be found together.
 """
 
 from __future__ import annotations
@@ -24,12 +25,11 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import StoreError, PortaWinuxError
+from . import PortaWinuxError, StoreError, hostname
 from .hooks import run_hooks
 from .manifest import DriveLayout, Manifest
 from .store import Snapshot, SnapshotStore
 from .workspace import commit_file_content, read_commit_meta
-
 
 # -- host state --------------------------------------------------------------
 
@@ -102,6 +102,7 @@ def take_system_snapshot(
         paths=paths,
         excludes=prof.excludes,
         tags=(["system", f"profile:{prof.name}"] + (extra_tags or [])),
+        host=hostname(),
     )
     run_hooks(layout, "post-snapshot", {"profile": prof.name, "snapshot": snap_id}, root=root)
     return snap_id
@@ -130,6 +131,7 @@ def sync(
     root: str = "/",
     force: bool = False,
     dry_run: bool = False,
+    safety_tags: list[str] | None = None,
 ) -> SyncResult:
     state = HostState.load(store.repo_id())
     commits = pending_commits(store, state)
@@ -156,7 +158,8 @@ def sync(
         )
         if existing:
             result.safety_snapshot = store.backup(
-                paths=existing, excludes=[], tags=["safety", "pre-sync"]
+                paths=existing, excludes=[], tags=safety_tags or ["safety", "pre:sync"],
+                host=hostname(),
             )
 
     for commit_snap, abs_path in all_files:
@@ -210,77 +213,142 @@ def _decide(
     return "write"  # new file locally
 
 
-# -- revert & full restore ---------------------------------------------------
+# -- restore -----------------------------------------------------------------
 
 
-def revert(
-    store: SnapshotStore,
-    layout: DriveLayout,
-    snapshot_id: str,
-    paths: list[str] | None,
-    root: str = "/",
-) -> str:
-    """Restore paths (default: everything in the snapshot) from an earlier
-    system snapshot onto the live system. Returns the safety snapshot id."""
-    snaps = {s.id: s for s in store.snapshots()}
-    snaps.update({s.short_id: s for s in store.snapshots()})
-    if snapshot_id not in snaps:
-        raise PortaWinuxError(f"unknown snapshot {snapshot_id}")
-    snap = snaps[snapshot_id]
-
-    affected = paths or snap.paths
-    existing = [str(_local_path(root, p)) for p in affected if _local_path(root, p).exists()]
-    safety = ""
-    if existing:
-        safety = store.backup(paths=existing, excludes=[], tags=["safety", "pre-revert"])
-
-    target = Path(root)
-    store.restore(snap.id, target=target, includes=paths)
-    run_hooks(layout, "post-sync", {"snapshot": snap.id, "paths": "\n".join(affected)}, root=root)
-    return safety
+def snapshot_by_spec(store: SnapshotStore, spec: str,
+                     candidates: list[Snapshot] | None = None) -> Snapshot:
+    """Resolve an id / short id / unique prefix to a Snapshot."""
+    snaps = candidates if candidates is not None else store.snapshots()
+    hits = [s for s in snaps if s.id == spec or s.short_id == spec]
+    if not hits:
+        hits = [s for s in snaps if s.id.startswith(spec)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise PortaWinuxError(f"unknown snapshot '{spec}' (see: porta-winux list)")
+    raise PortaWinuxError(f"snapshot prefix '{spec}' is ambiguous: "
+                          + ", ".join(h.short_id for h in hits))
 
 
 def select_restore_snapshot(
     store: SnapshotStore,
     manifest: Manifest,
     profile_name: str | None,
-    snapshot_id: str | None = None,
+    spec: str | None = None,
+    host: str | None = None,
+    any_host: bool = False,
 ) -> Snapshot:
-    """Pick the system snapshot restore_full would use (latest for the
-    profile, or the given id). Split out so the CLI can show a plan and
-    confirm with the user before anything is written."""
+    """Which snapshot `restore` will use.
+
+      spec given (id/prefix)  -> that snapshot, whatever profile or host
+      spec == "latest"        -> newest system snapshot of the profile, any host
+      no spec                 -> newest system snapshot of the profile taken
+                                 on ANOTHER machine (the cross-machine case);
+                                 `host` narrows to one machine, `any_host`
+                                 allows this machine's own snapshots
+    """
+    if spec and spec != "latest":
+        return snapshot_by_spec(store, spec)
     prof = manifest.profile(profile_name)
-    candidates = store.snapshots(tags=["system"])
-    candidates = [s for s in candidates if f"profile:{prof.name}" in s.tags]
-    if snapshot_id:
-        candidates = [s for s in candidates if s.id.startswith(snapshot_id)]
-    if not candidates:
-        raise PortaWinuxError(f"no system snapshots for profile '{prof.name}'")
-    return candidates[-1]
+    cands = [s for s in store.snapshots(tags=["system"]) if f"profile:{prof.name}" in s.tags]
+    me = hostname()
+    if host:
+        cands = [s for s in cands if s.hostname == host]
+        where = f"from host '{host}'"
+    elif spec == "latest" or any_host:
+        where = "from any host"
+    else:
+        cands = [s for s in cands if s.hostname != me]
+        where = f"from a host other than this one ({me})"
+    if not cands:
+        hint = " -- add --any-host to use this machine's own snapshots" \
+            if not (host or any_host or spec) else ""
+        raise PortaWinuxError(f"no system snapshots for profile '{prof.name}' {where}{hint}")
+    return cands[-1]
 
 
-def restore_full(
+def restore(
     store: SnapshotStore,
     layout: DriveLayout,
     manifest: Manifest,
-    profile_name: str | None,
+    snap: Snapshot,
+    paths: list[str] | None = None,
     root: str = "/",
-    snapshot_id: str | None = None,
-) -> Snapshot:
-    """Fresh-system setup: restore the latest (or given) system snapshot for a
-    profile onto `root`, then record it as this host's base."""
-    snap = select_restore_snapshot(store, manifest, profile_name, snapshot_id)
+    mirror: bool = False,
+    safety: bool = True,
+    safety_tags: list[str] | None = None,
+) -> str | None:
+    """Lay `snap` down onto `root`. With `paths`, only those (a partial
+    restore); without, the whole snapshot (a full restore, after which this
+    host's base is the snapshot and all older commits count as applied).
 
-    store.restore(snap.id, target=Path(root))
-    run_hooks(layout, "post-sync", {"snapshot": snap.id}, root=root)
+    mirror=True also deletes files under the restored paths that are not in
+    the snapshot -- the profile's excludes are protected so a mirror never
+    removes .cache & co. that were simply never backed up. The delete list is
+    computed here (see stale_paths) and executed by us, path by path; we do
+    not use restic's --delete (see ResticStore.restore for why).
 
-    state = HostState.load(store.repo_id())
-    state.base_snapshot = snap.id
-    # A fresh restore already contains every commit merged into snapshots up
-    # to `snap`; mark all existing commits applied to avoid re-application.
-    state.applied = [c.id for c in store.snapshots(tags=["commit"]) if c.time <= snap.time]
-    state.save()
-    return snap
+    Returns (safety snapshot id or None, list of deleted paths)."""
+    affected = paths or snap.paths
+    existing = [str(_local_path(root, p)) for p in affected if _local_path(root, p).exists()]
+    safety_id: str | None = None
+    if safety and existing:
+        safety_id = store.backup(paths=existing, excludes=[],
+                                 tags=safety_tags or ["safety", "pre:restore"], host=hostname())
+
+    stale: list[str] = []
+    if mirror:
+        stale = stale_paths(store, manifest, snap, affected, root)
+    store.restore(snap.id, target=Path(root), includes=paths)
+    deleted = _delete_paths(stale, root) if stale else []
+    run_hooks(layout, "post-sync", {"snapshot": snap.id, "paths": "\n".join(affected)}, root=root)
+
+    if not paths:
+        state = HostState.load(store.repo_id())
+        state.base_snapshot = snap.id
+        # A full restore already contains every commit merged into snapshots up
+        # to `snap`; mark all older commits applied to avoid re-application.
+        state.applied = [c.id for c in store.snapshots(tags=["commit"]) if c.time <= snap.time]
+        state.save()
+    return safety_id, deleted
+
+
+def profile_excludes(manifest: Manifest, snap: Snapshot) -> list[str]:
+    prof_name = next((t[len("profile:"):] for t in snap.tags if t.startswith("profile:")), None)
+    if prof_name and prof_name in manifest.profiles:
+        return list(manifest.profiles[prof_name].excludes)
+    return []
+
+
+def stale_paths(store: SnapshotStore, manifest: Manifest, snap: Snapshot,
+                paths: list[str], root: str = "/") -> list[str]:
+    """System paths under `paths` that exist locally but not in `snap`, with
+    the profile's excludes protected. This is exactly what --mirror deletes,
+    and exactly what the restore preview shows as removed."""
+    from . import compare as cmp
+    excludes = profile_excludes(manifest, snap)
+    live = cmp.listing_from_live(paths, excludes, root=root)
+    inside = cmp.listing_from_snapshot(store, snap.id, under=paths)
+    return sorted(p for p in live if p not in inside)
+
+
+def _delete_paths(sys_paths: list[str], root: str) -> list[str]:
+    """Remove files/symlinks, then directories bottom-up (only if empty --
+    a dir still holding excluded files such as .cache is left alone)."""
+    deleted: list[str] = []
+    for p in sorted(sys_paths, key=len, reverse=True):
+        lp = _local_path(root, p)
+        try:
+            if lp.is_symlink() or lp.is_file():
+                lp.unlink()
+                deleted.append(p)
+            elif lp.is_dir():
+                lp.rmdir()
+                deleted.append(p)
+        except OSError:
+            pass  # non-empty dir (protected contents) or vanished; not fatal
+    return deleted
 
 
 def print_sync_result(result: SyncResult) -> None:

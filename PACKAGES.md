@@ -78,7 +78,7 @@ sqlite databases (Firefox), a binary database (GNOME's dconf), whole
 directories. The design stance: **treat every config as an opaque file and
 let restic carry it.** Restic doesn't care about formats, and this folds
 configs into the machinery you already trust (snapshots, sync, conflicts,
-revert) instead of inventing per-app logic. Two mechanisms feed it:
+restore) instead of inventing per-app logic. Two mechanisms feed it:
 
 - **System configs (/etc):** RPM knows the original checksum of every
   config file it shipped, so `rpm` verification yields *exactly* the files
@@ -92,7 +92,7 @@ revert) instead of inventing per-app logic. Two mechanisms feed it:
 
 Adopted paths become a normal profile named **`system-configs`** — no new
 backup machinery, just `snapshot -p system-configs`, and sync/checkout/
-revert work on configs like any other files.
+restore work on configs like any other files.
 
 Format-specific caveats to know (not handled magically, by choice):
 
@@ -110,12 +110,11 @@ pre-existing config with the default). On a new machine:
 
 ```bash
 porta-winux pkg apply                       # 1. programs
-sudo porta-winux restore-full               # 2. your files
-sudo porta-winux revert latest \
-     /etc/…                                 # 3. (or sync) configs as needed
+sudo porta-winux restore                    # 2. your files (latest from your other machine)
+sudo porta-winux restore latest /etc/…      # 3. (or sync) configs as needed
 ```
 
-Wiring these into one confirmed `restore-full` orchestration is planned.
+Wiring these into one confirmed `restore` orchestration is planned.
 
 ## Files on the drive
 
