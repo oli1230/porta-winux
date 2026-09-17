@@ -58,7 +58,8 @@ def status(layout: DriveLayout) -> list[str]:
 
 
 def commit(
-    store: SnapshotStore, layout: DriveLayout, message: str, base_snapshot: str | None
+    store: SnapshotStore, layout: DriveLayout, message: str, base_snapshot: str | None,
+    extra_tags: list[str] | None = None,
 ) -> str:
     files = _workspace_files(layout)
     if not files:
@@ -75,7 +76,7 @@ def commit(
     snap_id = store.backup(
         paths=[str(layout.workspace_root)],
         excludes=[],
-        tags=["commit"],
+        tags=["commit"] + (extra_tags or []),
         host="porta-winux-workspace",  # stable host => stable parent chain & dedup
     )
     # Clear the workspace: the commit is now the source of truth.

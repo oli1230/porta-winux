@@ -167,10 +167,9 @@ def test_partition_argument_redirects_to_disk(monkeypatch):
 def test_init_offers_chown_on_unwritable_root(tmp_path, monkeypatch):
     """Regression: init-drive died with shutil Permission denied on a fresh
     root-owned btrfs partition; it must detect and offer the chown instead."""
-    from porta_winux import cli
+    from porta_winux import drivesetup as cli
 
     calls = []
-    monkeypatch.setattr(cli, "os", cli.os)
     monkeypatch.setattr(cli.os, "access", lambda p, m: False)
     import subprocess as sp
 
@@ -191,7 +190,7 @@ def test_init_offers_chown_on_unwritable_root(tmp_path, monkeypatch):
 
 
 def test_init_writable_root_is_untouched(tmp_path, monkeypatch):
-    from porta_winux import cli
+    from porta_winux import drivesetup as cli
     import subprocess as sp
     monkeypatch.setattr(sp, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran a command")))
     cli._ensure_writable_root(tmp_path, assume_yes=True)  # tmp_path is writable

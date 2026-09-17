@@ -12,7 +12,7 @@ those moments (an "event"):
 | `pre-snapshot/`  | just **before** backing up your files                   |
 | `post-snapshot/` | just **after** a backup finishes                        |
 | `pre-checkout/`  | just **before** extracting files into the workspace     |
-| `post-sync/`     | just **after** writing files onto a system (sync, revert, restore) |
+| `post-sync/`     | just **after** writing files onto a system (sync, restore) |
 
 That's the whole mechanism. There is no plugin API, no registration, no
 config: **a runnable file in one of these folders IS the extension.**
@@ -83,6 +83,6 @@ exist so git/tar preserve the empty directories.
 
 `post-sync/50-restorecon` — on Fedora, files carry SELinux security labels,
 and files written by porta-winux get generic ones. This script runs
-`restorecon` on every file a sync/revert/restore just wrote, resetting the
+`restorecon` on every file a sync/restore just wrote, resetting the
 labels to what Fedora's policy expects. It exits silently on systems
 without SELinux. (Background: https://docs.fedoraproject.org/en-US/quick-docs/selinux-getting-started/)

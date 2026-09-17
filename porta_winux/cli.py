@@ -5,19 +5,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import secrets
-import shutil
 import sys
 from pathlib import Path
 
-from . import PortaWinuxError, __version__
-from . import interact
-from .manifest import MANIFEST_NAME, DriveLayout, find_drive
-from .store import ResticStore
-from . import drivehealth
+from . import PortaWinuxError, __version__, drivehealth, drivesetup, hostname, interact, ops
+from . import compare as cmp
 from . import packages as pkgmod
 from . import sync as syncmod
 from . import workspace as ws
+from .manifest import MANIFEST_NAME, DriveLayout, find_drive
+from .store import ResticStore, Snapshot
 
 
 def _layout_store(args) -> tuple[DriveLayout, ResticStore]:
@@ -28,124 +25,99 @@ def _layout_store(args) -> tuple[DriveLayout, ResticStore]:
 # -- commands ----------------------------------------------------------------
 
 
-def _ensure_writable_root(root: Path, assume_yes: bool) -> None:
-    """Fresh btrfs/ext4 filesystems are root-owned; without this, init-drive
-    dies in Permission denied. Detect it and offer the chown."""
-    import getpass
-    import subprocess as sp
-    if not root.exists() or os.access(root, os.W_OK):
+def _profile_roots(manifest, prof_name: str | None) -> list[str]:
+    try:
+        return list(manifest.profile(prof_name).paths)
+    except PortaWinuxError:
+        return []
+
+
+def _print_change_tree(changes, roots, depth, expand=None, show_all=False, header=None):
+    if header:
+        print(header)
+    if not changes:
+        print("  no changes")
         return
-    user = getpass.getuser()
-    print(
-        f"{root} exists but you can't write to it — freshly formatted Linux\n"
-        f"filesystems are owned by root until ownership is handed over."
-    )
-    interact.confirm(
-        f"Run 'sudo chown {user}:{user} {root}' to take ownership?", assume_yes=assume_yes
-    )
-    if sp.run(["sudo", "chown", f"{user}:{user}", str(root)]).returncode != 0:
-        raise PortaWinuxError(f"chown failed; fix ownership of {root} manually and re-run")
-    if not os.access(root, os.W_OK):
-        raise PortaWinuxError(f"{root} is still not writable after chown")
-
-
-def cmd_init_drive(args) -> int:
-    # 1. Where? Prefer an interactive pick over a typed path a human can get wrong.
-    if args.path:
-        root = Path(args.path).resolve()
-    else:
-        cands = interact.removable_mount_candidates()
-        chosen = interact.choose(
-            "Which mounted drive should become the porta-winux drive?",
-            cands,
-            allow_other="type a path manually",
-        )
-        root = Path(chosen).resolve()
-
-    _ensure_writable_root(root, assume_yes=args.yes)
-
-    # 2. Show exactly what will happen before anything is written.
-    layout = DriveLayout(root=root)
-    already = manifest_preexisting = layout.manifest_path.exists()
-    print(f"\nPlan for {root}:")
-    if already:
-        print(f"  - {MANIFEST_NAME} already present: existing files will NOT be overwritten")
-    else:
-        print(f"  - copy drive template: {MANIFEST_NAME}, hooks.d/, bootstrap.sh, bin/")
-    print("  - create workspace/root/ (editable checkout area)")
-    if layout.password_file.exists():
-        print("  - .restic-pass already present: kept as-is")
-    elif args.password:
-        print("  - write your provided password to .restic-pass (mode 600)")
-    else:
-        print("  - generate a random repo password into .restic-pass (mode 600)")
-    if (layout.repo / "config").exists():
-        print("  - repo/ already initialized: left untouched")
-    else:
-        print("  - initialize an empty restic repository in repo/")
-    print("  - nothing outside this directory is touched\n")
-    interact.confirm(f"Initialize porta-winux drive at {root}?", assume_yes=args.yes)
-
-    root.mkdir(parents=True, exist_ok=True)
-
-    # Template ships inside the package so pip-installed copies work too.
-    template = Path(__file__).resolve().parent / "drive_template"
-    if not layout.manifest_path.exists():
-        if template.is_dir():
-            shutil.copytree(template, root, dirs_exist_ok=True)
-            # Wheel installs strip executable bits; restore them — but only
-            # on real programs (shebang/ELF), never READMEs or placeholders.
-            from .hooks import _is_runnable
-
-            for exe in [root / "bootstrap.sh", *(root / "hooks.d").rglob("*")]:
-                if exe.is_file() and _is_runnable(exe):
-                    exe.chmod(exe.stat().st_mode | 0o755)
-        else:
-            layout.manifest_path.write_text(_FALLBACK_MANIFEST)
-    layout.workspace_root.mkdir(parents=True, exist_ok=True)
-
-    if not layout.password_file.exists():
-        pw = args.password or secrets.token_urlsafe(32)
-        layout.password_file.write_text(pw + "\n")
-        layout.password_file.chmod(0o600)
-        if not args.password:
-            print(
-                "note: generated a random repo password in .restic-pass on the drive.\n"
-                "      Anyone holding the drive can read the repo. Copy the password\n"
-                "      somewhere safe and delete the file if you want theft protection\n"
-                "      (you will then be prompted / must set RESTIC_PASSWORD)."
-            )
-
-    if not manifest_preexisting:
-        pinned = drivehealth.pin_fstype(layout)
-        if pinned != "unknown":
-            print(f"pinned drive filesystem: {pinned} (writes refused if it ever differs)")
-    store = ResticStore(layout)
-    if not (layout.repo / "config").exists():
-        store.init()
-    drivehealth.mark_clean(layout)
-    print(f"\ninitialized porta-winux drive at {root}")
-    print("next step — tell porta-winux WHAT to back up:")
-    print(f"  1. edit {layout.manifest_path}  (add your paths under [profiles.*])")
-    print(f"  2. porta-winux --drive {root} snapshot")
-    return 0
+    tree = cmp.build_tree(changes, roots)
+    print(cmp.render_tree(tree, depth=depth, expand=expand, show_all=show_all))
 
 
 def cmd_snapshot(args) -> int:
     layout, store = _layout_store(args)
-    drivehealth.guard_writes(layout, force=getattr(args, 'force', False))
     manifest = layout.load_manifest()
-    snap = syncmod.take_system_snapshot(
-        store, layout, manifest, args.profile, root=args.root
-    )
-    # This snapshot now represents this host's known-good state: record it
-    # as the base used by sync's conflict detection.
+    prof = manifest.profile(args.profile)
+    me = hostname()
+    # What to compare against: this host's recorded base (its own last
+    # snapshot, or whatever it last restored/synced to), else the newest
+    # snapshot of the profile from this host.
+    all_system = store.snapshots(tags=["system"])
     state = syncmod.HostState.load(store.repo_id())
-    state.base_snapshot = snap
-    state.save()
+    parent = next((s for s in all_system if s.id == state.base_snapshot), None)
+    if parent is None:
+        prev = [s for s in all_system if f"profile:{prof.name}" in s.tags and s.hostname == me]
+        parent = prev[-1] if prev else None
+
+    if args.dry_run:
+        # Preview: live filesystem vs this host's last snapshot of the profile.
+        if not parent:
+            print(f"no previous '{prof.name}' snapshot from {me}: the first snapshot "
+                  f"will contain everything under {', '.join(prof.paths)}")
+            return 0
+        a = cmp.listing_from_snapshot(store, parent.id, under=parent.paths)
+        b = cmp.listing_from_live(prof.paths, prof.excludes, root=args.root)
+        changes = cmp.diff_listings(a, b, detect_moves=not args.no_moves)
+        _print_change_tree(changes, cmp.roots_for(changes, prof.paths, parent.paths),
+                           args.depth, header=f"would snapshot (vs {parent.short_id} "
+                           f"{parent.time[:19]}) -- nothing written:")
+        return 0
+
+    drivehealth.guard_writes(layout, force=args.force)
+    with ops.Operation(layout, "snapshot", force=args.force,
+                       force_reason="unclean-session" if args.force else None,
+                       args={"profile": prof.name}, root=args.root,
+                       message=args.message) as op:
+        snap = syncmod.take_system_snapshot(
+            store, layout, manifest, args.profile, root=args.root, extra_tags=op.tags()
+        )
+        op.record(result=snap, base=parent.id if parent else None)
+        # This snapshot now represents this host's known-good state: record it
+        # as the base used by sync's conflict detection.
+        state = syncmod.HostState.load(store.repo_id())
+        state.base_snapshot = snap
+        state.save()
     drivehealth.mark_clean(layout)
-    print(f"created system snapshot {snap[:8]}")
+    print(f"created system snapshot {snap[:8]}  (op {op.id}, profile {prof.name})")
+
+    if args.no_diff:
+        return 0
+    if not parent:
+        print("first snapshot of this profile from this host; nothing to compare against")
+        return 0
+    if parent.hostname != me:
+        print(f"(comparing against {parent.short_id} from {parent.hostname}, "
+              f"the snapshot this host last restored)")
+    new = syncmod.snapshot_by_spec(store, snap)
+    a = cmp.listing_from_snapshot(store, parent.id, under=parent.paths)
+    b = cmp.listing_from_snapshot(store, new.id, under=new.paths)
+    changes = cmp.diff_listings(a, b, detect_moves=not args.no_moves)
+    _print_change_tree(changes, cmp.roots_for(changes, prof.paths, new.paths), args.depth,
+                       header=f"changes since {parent.short_id} ({parent.time[:19]}):")
+    if new.stats:
+        print(f"restic: {new.stats} files, {_human(new.summary.get('data_added', 0))} added to repo")
+    _hint_duplicates(changes)
     return 0
+
+
+def _hint_duplicates(changes) -> None:
+    dups = [c for c in changes if c.status == "duplicate"]
+    if dups:
+        print("\nnote: directories marked '=' are identical copies of a directory that")
+        print("      also exists elsewhere -- typically the OLD location of a move that a")
+        print("      restore brought back. Remove the stale one, or use 'restore --mirror'.")
+
+
+def _human(n) -> str:
+    return cmp._fmt_size(int(n or 0))
 
 
 def cmd_list(args) -> int:
@@ -154,16 +126,78 @@ def cmd_list(args) -> int:
     if not snaps:
         print("no snapshots yet")
         return 0
-    for s in snaps:
-        kind = "commit" if s.is_commit else ("system" if s.is_system else "other")
-        extra = ""
-        if s.is_commit:
+    rows = ops.annotate(snaps, ops.read_journal(layout))
+    if args.kind:
+        rows = [r for r in rows if r["kind"] == args.kind]
+    if args.host:
+        rows = [r for r in rows if r["snap"].hostname == args.host]
+    if args.profile:
+        rows = [r for r in rows if r["profile"] == args.profile]
+    if args.op:
+        rows = [r for r in rows if r["op"] and r["op"].startswith(args.op)]
+    if args.forced:
+        # forced results AND the safety snapshots taken right before them
+        forced_ops = {r["op"] for r in rows if r["forced"] and r["op"]}
+        rows = [r for r in rows if r["forced"] or (r["op"] in forced_ops)]
+    if args.near:
+        target = syncmod.snapshot_by_spec(store, args.near, [r["snap"] for r in rows])
+        idx = next(i for i, r in enumerate(rows) if r["snap"].id == target.id)
+        rows = rows[max(0, idx - args.near_n): idx + args.near_n + 1]
+    if args.last:
+        rows = rows[-args.last:]
+    if not rows:
+        print("no matching snapshots")
+        return 0
+    print(f"{'id':8}  {'time':19}  {'kind':7}  {'host':12} {'profile':10} {'op':6}  "
+          f"{'flags':8} note")
+    for r in rows:
+        s: Snapshot = r["snap"]
+        flags = "FORCED" if r["forced"] else ""
+        note = ""
+        if r["kind"] == "safety":
+            note = f"before {r['pre'] or '?'}"
+        elif r["kind"] == "commit":
             try:
-                extra = "  " + ws.read_commit_meta(store, s).get("message", "")
+                note = ws.read_commit_meta(store, s).get("message", "")
             except PortaWinuxError:
                 pass
-        tags = ",".join(t for t in s.tags if not t.startswith("profile:")) or "-"
-        print(f"{s.short_id}  {s.time[:19]}  {kind:7}  {s.hostname:15} {tags}{extra}")
+        elif r["via"]:
+            note = f"via {r['via']}"
+        if s.stats and r["kind"] != "commit":
+            note += f"  [{s.stats}]"
+        if r["message"]:
+            note += f'  "{r["message"]}"'
+        if r["undo"]:
+            note += f"  undo: restore {r['undo'][:8]}"
+        print(f"{s.short_id:8}  {s.time[:19]}  {r['kind']:7}  {s.hostname[:12]:12} "
+              f"{(r['profile'] or '-')[:10]:10} {(r['op'] or '-'):6}  {flags:8} {note}".rstrip())
+    return 0
+
+
+def cmd_log(args) -> int:
+    layout, _ = _layout_store(args)
+    recs = ops.read_journal(layout)
+    if args.forced:
+        recs = [r for r in recs if r.get("forced")]
+    if args.op:
+        recs = [r for r in recs if r["op"].startswith(args.op)]
+    if args.cmd:
+        recs = [r for r in recs if r["cmd"] == args.cmd]
+    if args.last:
+        recs = recs[-args.last:]
+    if not recs:
+        print("no operations recorded" + (" (matching)" if (args.forced or args.op or args.cmd) else "")
+              + " -- the journal starts with the first write after upgrading to 0.4")
+        return 0
+    for r in recs:
+        print(ops.format_journal_line(r))
+        snaps = r.get("snapshots") or {}
+        if r.get("forced") and snaps.get("safety"):
+            print(f"        undo: porta-winux restore {str(snaps['safety'])[:8]}"
+                  + ("" if not snaps.get("result") else
+                     f"   (state right before op {r['op']} overwrote things)"))
+        for n in r.get("notes") or []:
+            print(f"        {n}")
     return 0
 
 
@@ -205,7 +239,11 @@ def cmd_commit(args) -> int:
     drivehealth.guard_writes(layout, force=getattr(args, 'force', False))
     latest_system = [s for s in store.snapshots(tags=["system"])]
     base = latest_system[-1].id if latest_system else None
-    snap = ws.commit(store, layout, args.message, base)
+    with ops.Operation(layout, "commit", force=args.force,
+                       force_reason="unclean-session" if args.force else None,
+                       message=args.message) as op:
+        snap = ws.commit(store, layout, args.message, base, extra_tags=op.tags())
+        op.record(result=snap, base=base)
     drivehealth.mark_clean(layout)
     print(f"committed as {snap[:8]}: {args.message}")
     return 0
@@ -232,51 +270,185 @@ def cmd_sync(args) -> int:
         )
 
     drivehealth.guard_writes(layout, force=args.force)
-    result = syncmod.sync(
-        store, layout, manifest, root=args.root, force=args.force, dry_run=False
-    )
-    syncmod.print_sync_result(result)
-    if result.applied_commits and not args.no_snapshot:
-        snap = syncmod.take_system_snapshot(store, layout, manifest, None, root=args.root)
-        state = syncmod.HostState.load(store.repo_id())
-        state.base_snapshot = snap
-        state.save()
-        print(f"post-sync system snapshot {snap[:8]} recorded as new base")
+    with ops.Operation(layout, "sync", force=args.force,
+                       force_reason="overwrite-conflicts" if args.force else None,
+                       args={"commits": [c[:8] for c in
+                             (c.id for c in syncmod.pending_commits(
+                                 store, syncmod.HostState.load(store.repo_id())))]},
+                       root=args.root) as op:
+        result = syncmod.sync(
+            store, layout, manifest, root=args.root, force=args.force, dry_run=False,
+            safety_tags=op.safety_tags(),
+        )
+        op.record(safety=result.safety_snapshot)
+        syncmod.print_sync_result(result)
+        if result.conflicts and args.force:
+            op.note(f"overwrote {len(result.conflicts)} conflicting local file(s)")
+        if result.applied_commits and not args.no_snapshot:
+            snap = syncmod.take_system_snapshot(store, layout, manifest, None, root=args.root,
+                                                extra_tags=op.tags())
+            state = syncmod.HostState.load(store.repo_id())
+            state.base_snapshot = snap
+            state.save()
+            op.record(result=snap)
+            print(f"post-sync system snapshot {snap[:8]} recorded as new base")
     drivehealth.mark_clean(layout)
     return 1 if result.conflicts and not args.force else 0
 
 
-def cmd_revert(args) -> int:
+def cmd_restore(args) -> int:
     layout, store = _layout_store(args)
-    scope = ", ".join(args.paths) if args.paths else "every path in the snapshot"
-    print(f"revert plan: restore {scope} from snapshot {args.snapshot} onto {args.root}")
-    print("a safety snapshot of the current state is taken first")
-    interact.confirm("Proceed with revert?", assume_yes=args.yes)
+    manifest = layout.load_manifest()
+    # `restore /some/path` (no snapshot) -> auto-select the snapshot, restore that path.
+    spec, paths = args.snapshot, list(args.paths)
+    if spec and spec.startswith("/"):
+        paths.insert(0, spec)
+        spec = None
+    snap = syncmod.select_restore_snapshot(store, manifest, args.profile, spec,
+                                           host=args.host, any_host=args.any_host)
+    me = hostname()
+    scope = ", ".join(paths) if paths else "every path in the snapshot"
+    prof_name = ops.profile_of(snap)
+    print(f"restore plan: {snap.short_id}  {snap.time[:19]}  from host {snap.hostname}"
+          + (" (this machine)" if snap.hostname == me else "")
+          + (f"  profile {prof_name}" if prof_name else "")
+          + (f"  op {ops.op_of(snap)}" if ops.op_of(snap) else ""))
+    print(f"  onto {args.root}: {scope}")
+    if args.mirror:
+        print("  MIRROR: files under those paths that are NOT in the snapshot will be DELETED"
+              " (profile excludes are protected)")
+    if not args.no_safety:
+        print("  a safety snapshot of the current state of those paths is taken first")
+
+    # Preview the effect: live vs snapshot, restricted to the restored paths.
+    # With --mirror the 'removed' entries are exactly the delete list
+    # (same listing logic as sync.stale_paths: profile excludes protected).
+    if not args.no_preview:
+        roots = paths or snap.paths
+        a = cmp.listing_from_live(roots, syncmod.profile_excludes(manifest, snap), root=args.root)
+        b = cmp.listing_from_snapshot(store, snap.id, under=roots)
+        changes = cmp.diff_listings(a, b, detect_moves=not args.no_moves)
+        if not args.mirror:
+            # without --mirror, files only present locally are left alone;
+            # a "moved" here means the old location would stay as a copy
+            kept = [c for c in changes if c.status in ("removed", "duplicate", "moved")]
+            changes = [c for c in changes if c.status not in ("removed", "duplicate", "moved")]
+            if kept:
+                print(f"  note: {len(kept)} local path(s) not in the snapshot are left in place "
+                      f"(--mirror would delete them):")
+                for c in kept[:10]:
+                    print(f"        {c.path}" + (f"  (moved to {c.other})" if c.status == "moved" else ""))
+                if len(kept) > 10:
+                    print(f"        … {len(kept) - 10} more")
+        _print_change_tree(changes, cmp.roots_for(changes, _profile_roots(manifest, prof_name), roots),
+                           args.depth, header="  effect on this system (live -> snapshot):")
+        if not changes and not args.dry_run:
+            print("  this system already matches the snapshot for those paths")
+    if args.dry_run:
+        print("dry run: nothing written")
+        return 0
+    interact.confirm("Proceed with restore?", assume_yes=args.yes)
     drivehealth.guard_writes(layout)
-    safety = syncmod.revert(store, layout, args.snapshot, args.paths or None, root=args.root)
-    if safety:
-        print(f"pre-revert safety snapshot: {safety[:8]}")
+    with ops.Operation(layout, "restore", args={"snapshot": snap.short_id, "from_host": snap.hostname,
+                                                "paths": paths, "mirror": args.mirror},
+                       root=args.root, message=args.message) as op:
+        safety, deleted = syncmod.restore(store, layout, manifest, snap, paths or None,
+                                          root=args.root, mirror=args.mirror,
+                                          safety=not args.no_safety, safety_tags=op.safety_tags())
+        op.record(safety=safety, result=snap.id)
+        if deleted:
+            op.note(f"mirror deleted {len(deleted)} path(s)")
     drivehealth.mark_clean(layout)
-    print(f"reverted to {args.snapshot}")
+    if safety:
+        print(f"safety snapshot: {safety[:8]}   (undo: porta-winux restore {safety[:8]})")
+    if deleted:
+        print(f"mirror: deleted {len(deleted)} stale path(s) not in the snapshot")
+    print(f"restored {snap.short_id} ({snap.time[:19]}, {snap.hostname}) onto {args.root}"
+          + ("" if paths else " -- this host's base is now that snapshot"))
     return 0
 
 
-def cmd_restore_full(args) -> int:
+def cmd_compare(args) -> int:
     layout, store = _layout_store(args)
     manifest = layout.load_manifest()
-    snap = syncmod.select_restore_snapshot(store, manifest, args.profile, args.snapshot)
-    print(
-        f"restore plan: lay down system snapshot {snap.short_id} "
-        f"({snap.time[:19]}, host {snap.hostname}) onto {args.root}"
-    )
-    print("existing files at those paths WILL be overwritten")
-    interact.confirm("Proceed with full restore?", assume_yes=args.yes)
-    drivehealth.guard_writes(layout)
-    snap = syncmod.restore_full(
-        store, layout, manifest, args.profile, root=args.root, snapshot_id=snap.id
-    )
-    drivehealth.mark_clean(layout)
-    print(f"restored system snapshot {snap.short_id} ({snap.time[:19]}) onto {args.root}")
+    specs = list(args.snapshots)
+    all_snaps = store.snapshots()
+
+    def resolve(spec: str) -> Snapshot:
+        if spec == "latest":
+            return syncmod.select_restore_snapshot(store, manifest, args.profile, "latest")
+        return syncmod.snapshot_by_spec(store, spec, all_snaps)
+
+    if len(specs) >= 3:
+        snaps = [resolve(x) for x in specs]
+        listings = [cmp.listing_from_snapshot(store, s.id, under=s.paths) for s in snaps]
+        prof0 = ops.profile_of(snaps[0]) or (args.profile or manifest.default_profile)
+        all_changes = [c for step in cmp.history(listings, detect_moves=not args.no_moves)[0] for c in step]
+        roots = cmp.roots_for(all_changes, _profile_roots(manifest, prof0), snaps[0].paths)
+        steps, tree = cmp.history(listings, detect_moves=not args.no_moves, roots=roots)
+        labels = [f"{s.short_id}@{s.hostname[:8]}" for s in snaps]
+        print(cmp.render_history(tree, labels, depth=args.depth, show_all=args.all))
+        return 0
+
+    if not specs:
+        # latest snapshot of the profile (this host preferred) vs the live system
+        prof = manifest.profile(args.profile)
+        cands = [s for s in all_snaps if s.is_system and f"profile:{prof.name}" in s.tags]
+        mine = [s for s in cands if s.hostname == hostname()]
+        if not cands:
+            raise PortaWinuxError(f"no system snapshots for profile '{prof.name}'")
+        snap_a, snap_b = (mine or cands)[-1], None
+    elif len(specs) == 1:
+        snap_a, snap_b = resolve(specs[0]), None
+    else:
+        snap_a, snap_b = resolve(specs[0]), resolve(specs[1])
+
+    prof_name = ops.profile_of(snap_a) or (args.profile or manifest.default_profile)
+    prof_paths = _profile_roots(manifest, prof_name)
+    excludes = manifest.profiles[prof_name].excludes if prof_name in manifest.profiles else []
+    a = cmp.listing_from_snapshot(store, snap_a.id, under=snap_a.paths)
+    label_a = f"{snap_a.short_id} ({snap_a.time[:19]}, {snap_a.hostname})"
+    if snap_b is None:
+        b = cmp.listing_from_live(snap_a.paths, excludes, root=args.root)
+        label_b = f"live system ({args.root})"
+        read_b = lambda p: cmp.local_path(args.root, p).read_bytes()  # noqa: E731
+    else:
+        b = cmp.listing_from_snapshot(store, snap_b.id, under=snap_b.paths)
+        label_b = f"{snap_b.short_id} ({snap_b.time[:19]}, {snap_b.hostname})"
+        read_b = lambda p: store.dump(snap_b.id, p)  # noqa: E731
+    read_a = lambda p: store.dump(snap_a.id, p)  # noqa: E731
+    changes = cmp.diff_listings(a, b, detect_moves=not args.no_moves)
+    if args.status:
+        changes = [c for c in changes if c.status == args.status]
+    roots = cmp.roots_for(changes, prof_paths, snap_a.paths)
+
+    if args.interactive:
+        try:
+            from .compare_tui import run_compare_tui
+        except ImportError:
+            raise PortaWinuxError("interactive compare needs Textual: pip install 'porta-winux[tui]'")
+        return run_compare_tui(cmp.build_tree(changes, roots), f"{snap_a.short_id} -> "
+                               + (snap_b.short_id if snap_b else "live"),
+                               label_a, label_b, read_a, read_b)
+    if args.flat:
+        for line in cmp.flat_lines(changes):
+            print(line)
+    else:
+        _print_change_tree(changes, roots, args.depth, expand=args.expand, show_all=args.all,
+                           header=f"{label_a}\n  -> {label_b}")
+    tree = cmp.build_tree(changes, roots)
+    total = sum(n.counts.total() for n in tree.children.values())
+    if changes:
+        print(f"\n{total} change(s): {cmp.summarize(sum((n.counts for n in tree.children.values()),
+                                                       start=__import__('collections').Counter()))}"
+              f"   ({cmp.GLYPH['added']} added  {cmp.GLYPH['removed']} removed  {cmp.GLYPH['modified']}"
+              f" modified  {cmp.GLYPH['moved']} moved  {cmp.GLYPH['duplicate']} duplicate  T type)")
+    _hint_duplicates(changes)
+    if args.confirm_moves and snap_b is not None:
+        for c in changes:
+            if c.status == "moved":
+                ok = cmp.confirm_move(store, snap_a.id, snap_b.id, c.path, c.other)
+                print(f"  {c.path} -> {c.other}: {'CONFIRMED identical content' if ok else 'content differs (edited during move?)'}")
     return 0
 
 
@@ -337,7 +509,7 @@ def cmd_prune(args) -> int:
     return 0
 
 
-def cmd_format_drive(args) -> int:
+def cmd_init_format(args) -> int:
     notes = drivehealth.format_drive_checks(args.device)
     subprocess_out = __import__("subprocess").run(
         ["lsblk", "-o", "NAME,SIZE,FSTYPE,LABEL,MODEL", args.device],
@@ -361,19 +533,41 @@ def cmd_format_drive(args) -> int:
     # Destructive formatting is interactive-only: --yes is deliberately NOT
     # honored here, and the confirmation is typing the device path itself.
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        raise PortaWinuxError("format-drive is interactive-only (no --yes bypass)")
+        raise PortaWinuxError("init format is interactive-only (no --yes bypass)")
     typed = input(f"Type the device path ({args.device}) to confirm: ").strip()
     if typed != args.device:
         raise PortaWinuxError("confirmation did not match; nothing was changed")
-    p2 = drivehealth.format_drive(args.device, args.shared, args.linux, args.fstype,
-                                  args.dup_data, not args.no_win)
-    print(f"\ndone. Next steps:")
-    print(f"  1. unplug and replug the drive (KDE will mount PW_SHARED and PW_LINUX)")
-    print(f"  2. porta-winux init-drive        # pick the PW_LINUX mount from the menu")
+    drivehealth.format_drive(args.device, args.shared, args.linux, args.fstype,
+                             args.dup_data, not args.no_win)
+    print("\ndone. Next steps:")
+    print("  1. unplug and replug the drive (KDE will mount PW_SHARED and PW_LINUX)")
+    print("  2. porta-winux init drive        # pick the PW_LINUX mount from the menu")
     print(f"     (init pins fstype={args.fstype}; writes are refused on anything else)")
-    print(f"  optional: stop auto-mounting the repo partition —")
-    print(f"     sudo cp setup/99-portawinux.rules /etc/udev/rules.d/ && sudo udevadm control --reload")
+    print("  optional: stop auto-mounting the repo partition —")
+    print("     sudo cp setup/99-portawinux.rules /etc/udev/rules.d/ && sudo udevadm control --reload")
     return 0
+
+
+def cmd_init_drive(args) -> int:
+    drivesetup.init_drive(args.path, args.password, args.yes)
+    return 0
+
+
+def cmd_init_detect(args) -> int:
+    return drivesetup.detect(args.drive, with_repo=not args.no_repo)
+
+
+def cmd_init_cleanup(args) -> int:
+    layout = find_drive(args.drive)
+    return drivesetup.cleanup(layout, args.yes, all_hosts_state=args.all_state)
+
+
+def cmd_init_uninstall(args) -> int:
+    layout = None
+    if not args.host_only:
+        layout = find_drive(args.drive)
+    return drivesetup.uninstall(layout, drive=not args.host_only, host=not args.drive_only,
+                                purge=args.purge)
 
 
 def cmd_eject(args) -> int:
@@ -538,20 +732,20 @@ def _resolve_snapshot(store, spec: str) -> str:
     return snaps[-1].id
 
 
-_FALLBACK_MANIFEST = """\
-[porta-winux]
-default_profile = "home"
-
-[profiles.home]
-paths = ["/home"]
-excludes = ["**/.cache", "**/node_modules", "**/.venv"]
-"""
+def _deprecated(new: str):
+    def wrap(func):
+        def inner(args):
+            print(f"note: this spelling is deprecated; use 'porta-winux {new}'", file=sys.stderr)
+            return func(args)
+        return inner
+    return wrap
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="porta-winux",
-        description="snapshot/checkout/commit/sync over a restic repo on an external drive",
+        description="snapshot/checkout/commit/sync/restore over a restic repo on an external drive",
+        epilog="run with no command to see which porta-winux drives are plugged in",
     )
     p.add_argument("--drive", help=f"drive root (dir containing {MANIFEST_NAME})")
     p.add_argument(
@@ -564,22 +758,76 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip confirmation prompts (for scripts, kickstart, CI)",
     )
+    p.add_argument("--eject", action="store_true",
+                   help="after the command succeeds, eject the drive (sync, unmount, power off)")
     p.add_argument("--version", action="version", version=f"porta-winux {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False, metavar="COMMAND")
 
-    s = sub.add_parser("init-drive", help="turn a directory/mounted drive into a porta-winux drive")
-    s.add_argument("path", nargs="?", help="drive root (interactive picker if omitted)")
-    s.add_argument("--password", help="repo password (default: generate and store on drive)")
-    s.set_defaults(func=cmd_init_drive)
+    # -- init group ----------------------------------------------------------
+    s = sub.add_parser("init", help="set up / inspect / take apart a porta-winux drive")
+    isub = s.add_subparsers(dest="init_cmd", required=True)
 
-    s = sub.add_parser("snapshot", help="take a system snapshot of a profile")
+    f = isub.add_parser("format", help="DESTRUCTIVE: partition a disk (exFAT shared / btrfs repo / NTFS reserved)")
+    f.add_argument("device", help="whole-disk device, e.g. /dev/sda")
+    f.add_argument("--shared", default="16G", help="PW_SHARED size (default 16G)")
+    f.add_argument("--linux", default="200G", help="PW_LINUX size (default 200G; ignored with --no-win)")
+    f.add_argument("--fstype", choices=["btrfs", "ext4"], default="btrfs")
+    f.add_argument("--dup-data", action="store_true",
+                   help="btrfs: store data twice (halves capacity, enables self-repair)")
+    f.add_argument("--no-win", action="store_true", help="skip the reserved Windows partition")
+    f.add_argument("-n", "--dry-run", action="store_true", help="print the exact commands only")
+    f.set_defaults(func=cmd_init_format)
+
+    d = isub.add_parser("drive", help="furnish a mounted partition as a porta-winux drive (idempotent)")
+    d.add_argument("path", nargs="?", help="drive root (interactive picker if omitted)")
+    d.add_argument("--password", help="repo password (default: generate and store on drive)")
+    d.set_defaults(func=cmd_init_drive)
+
+    d = isub.add_parser("detect", help="read-only: which porta-winux drives are plugged in, and their state")
+    d.add_argument("--no-repo", action="store_true", help="skip opening the repo (faster, no password needed)")
+    d.set_defaults(func=cmd_init_detect)
+
+    d = isub.add_parser("cleanup", help="tidy: this host's state for the drive, stale locks, unadopted drafts")
+    d.add_argument("--all-state", action="store_true", help="remove host state for EVERY repo, not just this drive")
+    d.set_defaults(func=cmd_init_cleanup)
+
+    d = isub.add_parser("uninstall", help="DESTRUCTIVE: remove porta-winux from the drive and this host")
+    d.add_argument("--host-only", action="store_true", help="only remove this host's state")
+    d.add_argument("--drive-only", action="store_true", help="only remove the drive's porta-winux files")
+    d.add_argument("--purge", action="store_true", help="also remove packages/configs/baseline .toml")
+    d.set_defaults(func=cmd_init_uninstall)
+
+    # -- daily commands --------------------------------------------------------
+    s = sub.add_parser("snapshot", help="take a system snapshot of a profile and show what changed")
     s.add_argument("-p", "--profile")
+    s.add_argument("-m", "--message", help="free-text note recorded in the journal")
     s.add_argument("--force", action="store_true",
                    help="write even after an unclean session (verify first instead!)")
+    s.add_argument("-n", "--dry-run", action="store_true",
+                   help="show what a snapshot would capture (live vs last snapshot); write nothing")
+    s.add_argument("--depth", type=int, default=2, help="tree depth to show (default 2)")
+    s.add_argument("--no-diff", action="store_true", help="skip the change summary")
+    s.add_argument("--no-moves", action="store_true", help="skip move/duplicate detection")
     s.set_defaults(func=cmd_snapshot)
 
-    s = sub.add_parser("list", help="list snapshots (system + commits)")
+    s = sub.add_parser("list", help="list snapshots with the operation that made them")
+    s.add_argument("--kind", choices=["system", "commit", "safety", "other"])
+    s.add_argument("--host")
+    s.add_argument("-p", "--profile")
+    s.add_argument("--op", help="only snapshots from this operation id (prefix ok)")
+    s.add_argument("--forced", action="store_true",
+                   help="only forced operations and the safety snapshots taken right before them")
+    s.add_argument("--near", metavar="SNAPSHOT", help="show snapshots around this one")
+    s.add_argument("--near-n", type=int, default=3, help="how many on each side of --near (default 3)")
+    s.add_argument("-n", "--last", type=int, help="only the newest N")
     s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("log", help="operation journal: every write command, its args, and the snapshots it made")
+    s.add_argument("--forced", action="store_true", help="only --force operations (each with its undo snapshot)")
+    s.add_argument("--op", help="one operation id (prefix ok)")
+    s.add_argument("--cmd", help="only this command (snapshot, sync, restore, commit)")
+    s.add_argument("-n", "--last", type=int)
+    s.set_defaults(func=cmd_log)
 
     s = sub.add_parser("ls", help="list files inside a snapshot")
     s.add_argument("snapshot", nargs="?", default="latest")
@@ -605,17 +853,60 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-snapshot", action="store_true", help="skip the post-sync base snapshot")
     s.set_defaults(func=cmd_sync)
 
-    s = sub.add_parser("revert", help="restore paths from an earlier snapshot")
-    s.add_argument("snapshot")
-    s.add_argument("paths", nargs="*", help="limit to these paths (default: whole snapshot)")
-    s.set_defaults(func=cmd_revert)
-
-    s = sub.add_parser("restore-full", help="fresh-system setup from the latest system snapshot")
+    s = sub.add_parser(
+        "restore",
+        help="lay a snapshot onto this system: whole (default: latest from ANOTHER machine) or given paths",
+        description="restore [SNAPSHOT] [PATH ...]\n"
+                    "  restore                    latest snapshot of the profile from another machine\n"
+                    "  restore latest             latest from any machine (including this one)\n"
+                    "  restore a1b2c3             that snapshot, entirely\n"
+                    "  restore a1b2c3 /home/u/x   only that path from it\n"
+                    "  restore /home/u/x          only that path, snapshot auto-selected\n"
+                    "A safety snapshot of the current state is taken first; undo is 'restore <safety-id>'.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument("snapshot", nargs="?", help="snapshot id/prefix, 'latest', or omit for other-machine latest")
+    s.add_argument("paths", nargs="*", help="limit to these absolute paths")
     s.add_argument("-p", "--profile")
-    s.add_argument("-s", "--snapshot", help="specific snapshot id instead of latest")
-    s.set_defaults(func=cmd_restore_full)
+    s.add_argument("--host", help="take the latest snapshot from this host")
+    s.add_argument("--any-host", action="store_true", help="allow this machine's own snapshots when auto-selecting")
+    s.add_argument("--mirror", action="store_true",
+                   help="also DELETE local files under the restored paths that are not in the snapshot "
+                        "(fixes stale copies left by moves; profile excludes are protected)")
+    s.add_argument("--no-safety", action="store_true", help="skip the safety snapshot")
+    s.add_argument("--no-preview", action="store_true", help="skip computing the change preview")
+    s.add_argument("--no-moves", action="store_true", help="skip move/duplicate detection in the preview")
+    s.add_argument("--depth", type=int, default=2, help="preview tree depth (default 2)")
+    s.add_argument("-n", "--dry-run", action="store_true", help="show the plan and preview only")
+    s.add_argument("-m", "--message", help="free-text note recorded in the journal")
+    s.set_defaults(func=cmd_restore)
 
-    s = sub.add_parser("diff", help="diff two snapshots")
+    s = sub.add_parser(
+        "compare",
+        help="what changed: latest snapshot vs live system, two snapshots, or a chain of them",
+        description="compare                  latest snapshot of the profile (this host) vs the live system\n"
+                    "compare A                snapshot A vs the live system\n"
+                    "compare A B              snapshot A vs snapshot B\n"
+                    "compare A B C ...        per-step history across a chain of snapshots\n"
+                    "Shown as a tree rooted at the profile paths, collapsed to --depth; "
+                    "--expand PATH opens one subtree, --all opens everything, -i is interactive.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    s.add_argument("snapshots", nargs="*", help="snapshot ids/prefixes or 'latest'")
+    s.add_argument("-p", "--profile")
+    s.add_argument("--depth", type=int, default=2)
+    s.add_argument("--expand", action="append", metavar="PATH", help="fully expand this subtree (repeatable)")
+    s.add_argument("--all", action="store_true", help="expand everything")
+    s.add_argument("--flat", action="store_true", help="one line per change instead of a tree")
+    s.add_argument("--status", choices=["added", "removed", "modified", "moved", "duplicate", "type"],
+                   help="only this kind of change")
+    s.add_argument("--no-moves", action="store_true", help="skip move/duplicate detection")
+    s.add_argument("--confirm-moves", action="store_true",
+                   help="verify detected moves with restic content hashes (snapshot-vs-snapshot only)")
+    s.add_argument("-i", "--interactive", action="store_true", help="interactive tree (Textual)")
+    s.set_defaults(func=cmd_compare)
+
+    s = sub.add_parser("diff", help="raw restic diff of two snapshots (one line per path; for scripts)")
     s.add_argument("a")
     s.add_argument("b")
     s.set_defaults(func=cmd_diff)
@@ -625,25 +916,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="full restic check --read-data (run after any unsafe unplug)")
     s.set_defaults(func=cmd_verify)
 
-    s = sub.add_parser(
-        "format-drive",
-        help="DESTRUCTIVE: partition a drive (exFAT shared / btrfs repo / NTFS reserved)",
-    )
-    s.add_argument("device", help="whole-disk device, e.g. /dev/sda")
-    s.add_argument("--shared", default="16G", help="PW_SHARED size (default 16G)")
-    s.add_argument("--linux", default="200G", help="PW_LINUX size (default 200G; ignored with --no-win)")
-    s.add_argument("--fstype", choices=["btrfs", "ext4"], default="btrfs")
-    s.add_argument("--dup-data", action="store_true",
-                   help="btrfs: store data twice (halves capacity, enables self-repair)")
-    s.add_argument("--no-win", action="store_true", help="skip the reserved Windows partition")
-    s.add_argument("-n", "--dry-run", action="store_true", help="print the exact commands only")
-    s.set_defaults(func=cmd_format_drive)
-
     s = sub.add_parser("eject", help="sync, mark clean, unmount, power off: SAFE TO UNPLUG")
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_eject)
 
-    s = sub.add_parser("prune", help="thin old system snapshots (keeps all commits)")
+    s = sub.add_parser("prune", help="thin old system/safety snapshots (keeps all commits)")
     s.add_argument("--keep-last", type=int, default=10)
     s.set_defaults(func=cmd_prune)
 
@@ -678,13 +955,49 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-s", "--snapshot", default="latest")
     s.set_defaults(func=cmd_browse)
 
+    # -- deprecated spellings (hidden; still work) -------------------------------
+    s = sub.add_parser("init-drive")
+    s.add_argument("path", nargs="?")
+    s.add_argument("--password")
+    s.set_defaults(func=_deprecated("init drive")(cmd_init_drive))
+
+    s = sub.add_parser("format-drive")
+    for a, kw in (("device", {}), ("--shared", {"default": "16G"}), ("--linux", {"default": "200G"}),
+                  ("--fstype", {"choices": ["btrfs", "ext4"], "default": "btrfs"}),
+                  ("--dup-data", {"action": "store_true"}), ("--no-win", {"action": "store_true"}),
+                  ("-n", {"action": "store_true", "dest": "dry_run"})):
+        s.add_argument(a, **kw)
+    s.set_defaults(func=_deprecated("init format")(cmd_init_format))
+
+    s = sub.add_parser("revert")
+    s.add_argument("snapshot")
+    s.add_argument("paths", nargs="*")
+    s.set_defaults(func=_deprecated("restore <snapshot> [paths]")(cmd_restore),
+                   profile=None, host=None, any_host=True, mirror=False, no_safety=False,
+                   no_preview=False, no_moves=False, depth=2, dry_run=False, message=None)
+
+    s = sub.add_parser("restore-full")
+    s.add_argument("-p", "--profile")
+    s.add_argument("-s", "--snapshot")
+    s.set_defaults(func=_deprecated("restore [snapshot]")(cmd_restore),
+                   paths=[], host=None, any_host=True, mirror=False, no_safety=False,
+                   no_preview=False, no_moves=False, depth=2, dry_run=False, message=None)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args)
+        if not args.command:
+            # "soft launch": no command = a read-only look at what's plugged in
+            rc = drivesetup.detect(args.drive, with_repo=True)
+            print("\nrun 'porta-winux --help' for the command list")
+            return rc
+        rc = args.func(args)
+        if rc == 0 and args.eject:
+            drivehealth.eject(find_drive(args.drive))
+        return rc
     except PortaWinuxError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

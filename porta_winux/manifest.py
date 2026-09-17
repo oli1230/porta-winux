@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from pathlib import Path
 from . import DriveNotFound, PortaWinuxError
 
 MANIFEST_NAME = "porta-winux.toml"
+SIGNATURE_NAME = ".porta-winux"   # machine-readable "this is a porta-winux drive"
+STATE_DIRNAME = ".pw-state"       # clean marker + operation journal
 
 
 @dataclass
@@ -99,6 +102,49 @@ class DriveLayout:
     def configs_path(self) -> Path:
         return self.root / "configs.toml"
 
+    @property
+    def signature_path(self) -> Path:
+        return self.root / SIGNATURE_NAME
+
+    @property
+    def state_dir(self) -> Path:
+        return self.root / STATE_DIRNAME
+
+    @property
+    def journal_path(self) -> Path:
+        return self.state_dir / "journal.jsonl"
+
+    def is_drive(self) -> bool:
+        """A drive is recognized by its signature file, or (drives made by
+        versions before 0.4) by the manifest alone."""
+        return self.signature_path.exists() or self.manifest_path.exists()
+
+    def read_signature(self) -> dict | None:
+        """Contents of .porta-winux, or None when absent/unreadable."""
+        try:
+            return json.loads(self.signature_path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def write_signature(self, version: str) -> dict:
+        """Create the signature if missing (idempotent: an existing drive id
+        is never changed, because host state and logs refer to it)."""
+        sig = self.read_signature()
+        if sig and sig.get("drive_id"):
+            return sig
+        import socket
+        import uuid
+        from datetime import datetime, timezone
+        sig = {
+            "format": 1,
+            "drive_id": str(uuid.uuid4()),
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "created_by": socket.gethostname(),
+            "created_with": f"porta-winux {version}",
+        }
+        self.signature_path.write_text(json.dumps(sig, indent=2) + "\n")
+        return sig
+
     def load_manifest(self) -> Manifest:
         if not self.manifest_path.exists():
             raise DriveNotFound(f"no {MANIFEST_NAME} at {self.root}")
@@ -120,32 +166,44 @@ class DriveLayout:
         return m
 
 
-def find_drive(explicit: str | None) -> DriveLayout:
-    """Locate the drive root.
+def mount_candidates() -> list[Path]:
+    """Directories where a plugged-in drive typically appears."""
+    out: list[Path] = []
+    user = os.environ.get("USER", "")
+    for base in (Path(f"/run/media/{user}"), Path("/media"), Path("/mnt")):
+        if base.is_dir():
+            try:
+                out.extend(p for p in sorted(base.iterdir()) if p.is_dir())
+            except PermissionError:
+                pass
+    return out
 
-    Order: --drive flag, $PORTA_WINUX_DRIVE, then a scan of common removable
-    mount points for a porta-winux.toml.
-    """
-    candidates: list[Path] = []
+
+def drive_candidates(explicit: str | None) -> list[Path]:
+    """Where to look, in order: --drive, $PORTA_WINUX_DRIVE, then the usual
+    removable mount points."""
     if explicit:
-        candidates.append(Path(explicit))
-    elif os.environ.get("PORTA_WINUX_DRIVE"):
-        candidates.append(Path(os.environ["PORTA_WINUX_DRIVE"]))
-    else:
-        user = os.environ.get("USER", "")
-        for base in (Path(f"/run/media/{user}"), Path("/media"), Path("/mnt")):
-            if base.is_dir():
-                try:
-                    candidates.extend(sorted(base.iterdir()))
-                except PermissionError:
-                    pass
+        return [Path(explicit)]
+    if os.environ.get("PORTA_WINUX_DRIVE"):
+        return [Path(os.environ["PORTA_WINUX_DRIVE"])]
+    return mount_candidates()
 
-    for c in candidates:
-        if (c / MANIFEST_NAME).exists():
-            return DriveLayout(root=c.resolve())
 
+def scan_drives(explicit: str | None = None) -> list[DriveLayout]:
+    """Every porta-winux drive visible right now (read-only, never raises)."""
+    return [DriveLayout(root=c.resolve()) for c in drive_candidates(explicit)
+            if DriveLayout(root=c).is_drive()]
+
+
+def find_drive(explicit: str | None) -> DriveLayout:
+    """Locate the drive root: the first candidate carrying a .porta-winux
+    signature or a porta-winux.toml manifest."""
+    found = scan_drives(explicit)
+    if found:
+        return found[0]
     hint = explicit or os.environ.get("PORTA_WINUX_DRIVE") or "auto-detect"
     raise DriveNotFound(
         f"could not find a porta-winux drive ({hint}); "
-        f"pass --drive /path/to/mounted/drive or set PORTA_WINUX_DRIVE"
+        f"pass --drive /path/to/mounted/drive or set PORTA_WINUX_DRIVE. "
+        f"To see what IS plugged in: porta-winux init detect"
     )
